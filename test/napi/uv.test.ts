@@ -981,6 +981,8 @@ describe.if(!isWindows)("uv stubs", () => {
     ["a microtask", `Promise.resolve().then(() => addon.closeOrderClose());`],
     ["process.nextTick", `process.nextTick(() => addon.closeOrderClose());`],
     ["a JS timer", `setTimeout(() => addon.closeOrderClose(), 1);`],
+    // The peer of the watched socket is closed, so the socket is readable and the loop's poll runs poll_cb.
+    ["a poll_cb", `addon.testPollHangup(event => { if (event === "poll") addon.closeOrderClose(); });`],
   ])("close_cb runs after the check handles when uv_close is called from %s", async (_, close) => {
     const { stdout, stderr, exitCode } = await runInChild(`
       addon.testCloseOrder(report);
@@ -988,6 +990,45 @@ describe.if(!isWindows)("uv stubs", () => {
     `);
     expect(stderr).toBe("");
     expect(stdout).toBe("closing 1 0\ncheck 0 0\nclose 1 0\n");
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent("close_cb runs before the next check callback when a check callback calls uv_close", async () => {
+    // libuv runs the close callbacks right after the check handles of the same loop iteration.
+    const { stdout, stderr, exitCode } = await runInChild(`
+      addon.testCloseOrder((event, a, b) => {
+        report(event, a, b);
+        if (event === "in check") addon.closeOrderClose();
+      });
+      addon.closeOrderReportCheck();
+    `);
+    expect(stderr).toBe("");
+    // A check callback between uv_close and close_cb would report "check 0 0".
+    expect(stdout).toBe("in check 0 0\nclosing 1 0\nclose 0 0\n");
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent("close_cb runs while JS that a check callback called runs the event loop", async () => {
+    // Bun.build() runs the event loop until the promise that a plugin's setup() returned settles, and only close_cb
+    // settles this one. The check handles don't run in there, so a close_cb that waited for them would never run.
+    const { stdout, stderr, exitCode } = await runInChild(`
+      let wait;
+      addon.testCloseOrder((event, a, b) => {
+        report(event, a, b);
+        if (event === "close") wait.reject(new Error("close_cb ran inside the check callback"));
+        if (event !== "in check") return;
+        wait = Promise.withResolvers();
+        addon.closeOrderClose();
+        try {
+          Bun.build({ entrypoints: [], plugins: [{ name: "wait", setup: () => wait.promise }] });
+        } catch (error) {
+          console.log(error.message);
+        }
+      });
+      addon.closeOrderReportCheck();
+    `);
+    expect(stderr).toBe("");
+    expect(stdout).toBe("in check 0 0\nclosing 1 0\nclose 0 0\nclose_cb ran inside the check callback\n");
     expect(exitCode).toBe(0);
   });
 

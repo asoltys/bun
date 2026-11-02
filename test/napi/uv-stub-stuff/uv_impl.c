@@ -1765,6 +1765,8 @@ struct close_order_test {
   bool closing;
   bool check_ran;
   bool close_cb_ran;
+  // closeOrderReportCheck() asked for the next check callback.
+  bool report_check;
 };
 
 static struct close_order_test *close_order;
@@ -1784,6 +1786,14 @@ static void close_order_async_close_cb(uv_handle_t *handle) {
 
 static void close_order_check_cb(uv_check_t *handle) {
   struct close_order_test *test = handle->data;
+  if (test->report_check) {
+    test->report_check = false;
+    // The script closes the async handle in this call. If it also runs the
+    // event loop there, close_cb frees `test`, so this reports through a copy.
+    struct reporter reporter = test->reporter;
+    report(&reporter, "in check", 0, 0);
+    return;
+  }
   if (!test->closing || test->check_ran)
     return;
   test->check_ran = true;
@@ -1799,6 +1809,11 @@ static void unused_close_order_async_cb(uv_async_t *handle) { (void)handle; }
 //   closing 1 0    right after uv_close
 //   check 0 0      the next check callback: close_cb has not run
 //   close 1 0      close_cb: a check callback ran since uv_close
+// After closeOrderReportCheck() the script closes from inside a check
+// callback, and libuv runs close_cb before the next one. Then the events are:
+//   in check 0 0   the check callback that the script closes from
+//   closing 1 0
+//   close 0 0      close_cb: no check callback ran since uv_close
 static napi_value test_close_order(napi_env env, napi_callback_info info) {
   napi_value args[1];
   get_args(env, info, args, 1);
@@ -1827,6 +1842,17 @@ static napi_value close_order_close(napi_env env, napi_callback_info info) {
   uv_close((uv_handle_t *)&test->async, close_order_async_close_cb);
   report(&test->reporter, "closing", uv_is_closing((uv_handle_t *)&test->async),
          0);
+  return NULL;
+}
+
+// closeOrderReportCheck() makes the next check callback report to the script.
+// The send wakes the loop, which runs the check handles after its poll.
+static napi_value close_order_report_check(napi_env env,
+                                           napi_callback_info info) {
+  if (close_order != NULL) {
+    close_order->report_check = true;
+    uv_async_send(&close_order->async);
+  }
   return NULL;
 }
 
@@ -1985,6 +2011,9 @@ napi_value Init(napi_env env, napi_value exports) {
 
   napi_create_function(env, NULL, 0, close_order_close, NULL, &fn);
   napi_set_named_property(env, exports, "closeOrderClose", fn);
+
+  napi_create_function(env, NULL, 0, close_order_report_check, NULL, &fn);
+  napi_set_named_property(env, exports, "closeOrderReportCheck", fn);
 
   napi_create_function(env, NULL, 0, test_poll_close_order, NULL, &fn);
   napi_set_named_property(env, exports, "testPollCloseOrder", fn);
