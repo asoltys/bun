@@ -50,3 +50,13 @@ show("w", () => { `${Level.High}${Symbol() as any}`; });
 show("x", () => { Level.High + (Symbol() as any); });
 show("y", () => { (Symbol() as any) + Level.High; });
 show("z", () => { const { x } = nothing[Level.High]; });
+// prettier-ignore
+show("o, with the parenthesis and the arguments on lines of their own", () => {
+  (Level.High as any
+  )
+    (1);
+});
+show("o, through a constant that is used once", () => {
+  const once = Level.High as any;
+  once();
+});

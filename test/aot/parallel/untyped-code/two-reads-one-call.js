@@ -1,4 +1,4 @@
-// Two reads by name that compile to one stub call (`a.b.c`, `[a.x, a.y]`, `[a.x, b.y]`) and a read fused with its test (`if (a.flag)`, `a.kind === "leaf"`), on plain objects, class instances, getters and proxies. When one of the reads throws, the error names that read's property and its stack has that read's line and column. Five rows of `sameReceiverOnTwoLines` differ from plain Bun: its transpiler puts a constant that is used once in the place of its use, so the read of `const x = a.x` is reported a line below where it stands.
+// Two reads by name that compile to one stub call (`a.b.c`, `[a.x, a.y]`, `[a.x, b.y]`) and a read fused with its test (`if (a.flag)`, `a.kind === "leaf"`), on plain objects, class instances, getters and proxies. When one of the reads throws, the error names that read's property and its stack has that read's line and column.
 const lines = [];
 const say = (...parts) => lines.push(parts.map(String).join(" "));
 const show = value => {

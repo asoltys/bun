@@ -1165,6 +1165,7 @@ impl<'a> Converter<'a, '_> {
             tag,
             parts: leak(parts),
             head: contents(0),
+            head_loc: Loc::EMPTY,
         })
     }
 

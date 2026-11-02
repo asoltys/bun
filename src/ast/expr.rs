@@ -1957,6 +1957,7 @@ impl Data {
                     // `TemplateContents` is POD-shaped; `shallow_clone` is the
                     // safe field-wise copy.
                     head: el.head.shallow_clone(),
+                    head_loc: el.head_loc,
                 });
                 Ok(Data::ETemplate(StoreRef::from_bump(item)))
             }

@@ -2045,6 +2045,8 @@ pub struct Template {
     /// `parts()` / `parts_mut()` for ergonomic access; never null.
     pub parts: crate::StoreSlice<TemplatePart>,
     pub head: TemplateContents,
+    /// Where the opening backquote stands in the source. `Loc::EMPTY` for a template that was not written.
+    pub head_loc: crate::Loc,
 }
 
 impl Template {
@@ -2267,6 +2269,7 @@ impl Template {
                         .expect("infallible: variant checked")
                         .shallow_clone(),
                 ),
+                head_loc: self.head_loc,
             },
             loc,
         )

@@ -5,6 +5,7 @@
 // runtime says `e` was thrown, which has to be the first "text" of the file. Neither position is written down anywhere:
 // the test looks for the call in the text. A call in tail position has no caller to report, so `at()` is never returned.
 // `ran()` only counts its calls, for the initializer of a field: JSC keeps the function it is in out of stack traces.
+// `caught(e, "text", 1)` is about the frame of the file that called the first one. `fails` throws in another file.
 
 export type Case = {
   /** Functions that ran / functions in the file. */
@@ -1047,6 +1048,254 @@ export const cases: Record<string, Case> = {
  1|try { null!.ofNull; } catch (e) { caught(e, "null!"); }
 `,
   },
+  // An expression on several lines is printed on one. A frame is on the line of the token that the engine has it at.
+  "line-breaks.ts": {
+    functions: "7/7",
+    lines: `
+ 2|const empty: any = { missing: null, self() { return this; }, nothing() {} };
+ 1|const callers: any = [null, fails.call];
+ 1|const registry = new Map([["five", 5]]);
+ 1|try {
+ 1|  empty
+ 1|    .self()
+ 1|    .nothing()
+ 1|    .first;
+ 1|} catch (e) {
+ 1|  caught(e, ".first");
+ -|}
+ 1|try {
+ 1|  empty
+ 1|    .missing
+ 1|    [0];
+ 1|} catch (e) {
+ 1|  caught(e, "[0]");
+ -|}
+ 1|try {
+ 1|  empty
+ 1|    .missing
+ 1|    .stored = 1;
+ 1|} catch (e) {
+ 1|  caught(e, ".stored");
+ -|}
+ 1|try {
+ 1|  fails
+ 1|    .self()
+ 1|    .value;
+ 1|} catch (e) {
+ 1|  caught(e, ".value");
+ -|}
+ 1|try {
+ 1|  notDeclaredEither
+ 1|    .member;
+ 1|} catch (e) {
+ 1|  caught(e, "notDeclaredEither");
+ -|}
+ 1|try {
+ 1|  fails
+ 1|    .self()
+ 1|    .call();
+ 1|} catch (e) {
+ 1|  caught(e, "call()");
+ -|}
+ 1|try {
+ 1|  fails.make(
+ 1|    1,
+ 1|  )(23);
+ 1|} catch (e) {
+ 1|  caught(e, ")(23)");
+ -|}
+ 1|try {
+ 1|  (() => {
+ 1|    fails.call();
+ 1|  })(45);
+ 1|} catch (e) {
+ 1|  caught(e, "(45)", 1);
+ -|}
+ -|// What a constant that is read once holds is printed in place of its name. The call is on the line of the name.
+ 1|try {
+ 1|  const once = () => {
+ 1|    fails.call();
+ -|  };
+ 1|  once(67);
+ 1|} catch (e) {
+ 1|  caught(e, "once(67)", 1);
+ -|}
+ 1|try {
+ 1|  const made = fails.make(1);
+ 1|  const r = made(2);
+ 1|} catch (e) {
+ 1|  caught(e, "made(2)");
+ -|}
+ 1|try {
+ 1|  const handler: any = registry.get("five");
+ 1|  const out = handler(1);
+ 1|} catch (e) {
+ 1|  caught(e, "handler(1)");
+ -|}
+ 1|try {
+ 1|  fails.call
+ 1|    ?.(89);
+ 1|} catch (e) {
+ 1|  caught(e, "(89)");
+ -|}
+ 1|try {
+ 1|  fails.tag
+ 1|    \`tagged\`;
+ 1|} catch (e) {
+ 1|  caught(e, "\`tagged\`");
+ -|}
+ 1|try {
+ 1|  fails.tag
+ 1|    \`a head
+ -|    on two lines\`;
+ 1|} catch (e) {
+ 1|  caught(e, "\`a head");
+ -|}
+ 1|try {
+ 1|  const
+ 1|    [first] = 1 as any;
+ 1|} catch (e) {
+ 1|  caught(e, "[first]");
+ -|}
+ 1|async function later() {
+ 1|  try {
+ 1|    (await empty.missing)
+ 1|      .awaited;
+ 1|  } catch (e) {
+ 1|    caught(e, ".awaited");
+ -|  }
+ -|}
+ 1|later();
+ 1|function* steps() {
+ 1|  try {
+ 1|    (yield 1)
+ 1|      .yielded;
+ 1|  } catch (e) {
+ 1|    caught(e, ".yielded");
+ -|  }
+ -|}
+ 1|for (const step of steps()) void step;
+ 1|try {
+ 1|  empty.missing
+ -|    // the dot is below.
+ 1|    .below;
+ 1|} catch (e) {
+ 1|  caught(e, ".below");
+ -|}
+ -|// A line comment can end like the token that is looked for. No frame is on the line of a comment.
+ 1|try {
+ 1|  fails.make(5) /* a function */
+ -|  // that is called (too)
+ 1|  (6);
+ 1|} catch (e) {
+ 1|  caught(e, ") /* a function */");
+ -|}
+ 1|try {
+ 1|  callers[1]
+ -|  // the one at [1]
+ 1|  (7);
+ 1|} catch (e) {
+ 1|  caught(e, "1]");
+ -|}
+ 1|try {
+ 1|  (() => {
+ 1|    return fails.call;
+ 1|  })() /* gives one */
+ -|  // (which is called)
+ 1|  (8);
+ 1|} catch (e) {
+ 1|  caught(e, ") /* gives one */");
+ -|}
+ 1|try {
+ 1|  (0, fails.call)
+ -|  // a group (in parentheses)
+ 1|  (9);
+ 1|} catch (e) {
+ 1|  caught(e, "call)");
+ -|}
+ 1|try {
+ 1|  empty.missing.
+ -|    // see the docs.
+ 1|    b;
+ 1|} catch (e) {
+ 1|  caught(e, "missing.");
+ -|}
+ 1|try {
+ 1|  empty.missing[
+ -|    // the first [
+ 1|    2
+ -|  ];
+ 1|} catch (e) {
+ 1|  caught(e, "missing[");
+ -|}
+ 1|try {
+ 1|  empty.nothing(). /* nothing */
+ -|    // explain it.
+ 1|    c;
+ 1|} catch (e) {
+ 1|  caught(e, "). /* nothing */");
+ -|}
+ 1|try {
+ 1|  fails.self()?. /* itself */
+ -|    // or fails.self()?.
+ 1|    value;
+ 1|} catch (e) {
+ 1|  caught(e, ")?. /* itself */");
+ -|}
+ 1|try {
+ 1|  fails.make(10)?.(
+ -|    // maybe?.(
+ 1|    11);
+ 1|} catch (e) {
+ 1|  caught(e, ")?.(");
+ -|}
+ 1|try {
+ 1|  String.raw\`x\`
+ -|  // a \`quote\`
+ 1|  (12);
+ 1|} catch (e) {
+ 1|  caught(e, "raw\`x\`");
+ -|}
+ 1|try {
+ 1|  for (const item of
+ -|    // every one of
+ 1|    empty.missing) void item;
+ 1|} catch (e) {
+ 1|  caught(e, "item of");
+ -|}
+`,
+  },
+  // Issue #17153: declarations in a row stay apart. A minified bundle joins them: its frame is at the second text.
+  "declarations.ts": {
+    functions: "2/4",
+    lines: `
+ -|type IPost = { id: number };
+ 1|async function scrape(response: any[]): Promise<number> {
+ 1|  const data = (
+ 1|    await Promise.all(
+ 1|      response.map(async (post): Promise<IPost | null> => post)
+ 1|    )
+ 1|  ).filter((post) => post) as IPost[];
+ -|  // Set limit
+ 1|  const [{ id }] = data;
+ 1|  return id;
+ -|}
+ 1|scrape([]).catch(e => caught(e, "const [{ id }]", "[{ id }]"));
+ 1|const o: any = undefined;
+ 1|try {
+ 1|  const a = o.x;
+ 1|  const b = o.y;
+ 1|} catch (e) {
+ 1|  caught(e, "o.x", "o.y");
+ -|}
+ 1|try {
+ 1|  const c = o.z,
+ 1|    d = o.w;
+ 1|} catch (e) {
+ 1|  caught(e, "o.w");
+ -|}
+`,
+  },
   "common.cjs": {
     functions: "1/1",
     lines: `
@@ -1210,4 +1459,249 @@ test("snapshots", () => {
   expect(3)
     .toMatchInlineSnapshot(«\`3\`»);
 });
+`;
+
+// Plain JavaScript that also runs as it is written. ASCII only: Bun reads that copy as Latin-1. Every row throws.
+export const asWritten = `
+const fails = {
+  self() { return this; },
+  call() { throw new Error("called"); },
+  make() { return fails.call; },
+  tag() { throw new Error("tagged"); },
+  get value() { throw new Error("read"); },
+};
+const empty = { missing: null, self() { return this; }, nothing() {} };
+const callers = [null, fails.call];
+const registry = new Map([["five", 5]]);
+const rows = {
+  member() {
+    empty
+      .self()
+      .nothing()
+      .first;
+  },
+  index() {
+    empty
+      .missing
+      [0];
+  },
+  store() {
+    empty
+      .missing
+      .stored = 1;
+  },
+  getter() {
+    fails
+      .self()
+      .value;
+  },
+  optionalMember() {
+    fails
+      .self()
+      ?.value;
+  },
+  nameThenMember() {
+    notDeclared
+      .member;
+  },
+  nameThenIndex() {
+    notDeclared
+      [0];
+  },
+  nameThenTag() {
+    notDeclared
+      \`tagged\`;
+  },
+  callOfMember() {
+    fails
+      .self()
+      .call();
+  },
+  callOfResult() {
+    fails.make(
+      1,
+    )(2);
+  },
+  callOfFunction() {
+    (() => {
+      fails.call();
+    })(3);
+  },
+  callOfGroup() {
+    (fails.make()
+    )
+      (4);
+  },
+  functionUsedOnce() {
+    const once = () => {
+      fails.call();
+    };
+    once(5);
+  },
+  resultUsedOnce() {
+    const made = fails.make(6);
+    const result = made(7);
+    return result + 1;
+  },
+  numberUsedOnce() {
+    const handler = registry.get("five");
+    const answer = handler(8);
+    return answer + 1;
+  },
+  optionalCall() {
+    fails.call
+      ?.(9);
+  },
+  tag() {
+    fails.tag
+      \`tagged\`;
+  },
+  tagOnTwoLines() {
+    fails.tag
+      \`a head
+      on two lines\`;
+  },
+  of() {
+    for (const each
+      of 1) void each;
+  },
+  pattern() {
+    const
+      [first] = 1;
+  },
+  ofAfterPattern() {
+    for (const
+      [] of null) {}
+  },
+  async afterAwait() {
+    (await empty.missing)
+      .awaited;
+  },
+  inGenerator() {
+    function* steps() {
+      (yield 1)
+        .yielded;
+    }
+    for (const step of steps()) void step;
+  },
+  declarations(nothing) {
+    const first = nothing.x;
+    const second = nothing.y;
+    return [first, second];
+  },
+  patternAfterDeclaration() {
+    const data = [1].filter(
+      each => each > 1,
+    );
+    // a comment
+    const [{ id }] = data;
+    return id;
+  },
+  dotBelowComment() {
+    empty.missing
+      // the dot is below.
+      .below;
+  },
+  commentAfterCall() {
+    fails.make(10)
+    // that is called (too)
+    (11);
+  },
+  commentAfterElement() {
+    callers[1]
+    // the one at [1]
+    (12);
+  },
+  commentAfterCalledFunction() {
+    (() => {
+      return fails.call;
+    })()
+    // (which is called)
+    (13);
+  },
+  commentAfterGroup() {
+    (0, fails.call)
+    // a group (in parentheses)
+    (14);
+  },
+  commentAfterDot() {
+    empty.missing.
+      // see the docs.
+      b;
+  },
+  commentAfterBracket() {
+    empty.missing[
+      // the first [
+      2
+    ];
+  },
+  commentAfterDotOfCall() {
+    empty.nothing().
+      // explain it.
+      c;
+  },
+  commentAfterOptionalDot() {
+    fails.self()?.
+      // or fails.self()?.
+      value;
+  },
+  commentInOptionalCall() {
+    fails.make(15)?.(
+      // maybe?.(
+      16);
+  },
+  commentAfterTemplate() {
+    String.raw\`x\`
+    // a \`quote\`
+    (17);
+  },
+  memberOfName(nothing) {
+    nothing
+      .member;
+  },
+  indexOfName(nothing) {
+    nothing
+      [0];
+  },
+  tagOfName(tag = fails.tag) {
+    tag
+      \`tagged\`;
+  },
+  lastArgument() {
+    String(
+      notDeclared
+    );
+  },
+  spread() {
+    String(...
+      1);
+  },
+  construct() {
+    new
+      empty.missing();
+  },
+  membersOfOneObject(nothing) {
+    const first = nothing.x,
+      second = nothing.y;
+    return [first, second];
+  },
+  commentAboveCallOfFunction() {
+    (function () {
+      fails.call();
+    })
+    // call it (now)
+    ();
+  },
+};
+const frames = {};
+for (const [name, row] of Object.entries(rows)) {
+  try {
+    await row();
+    frames[name] = "did not throw";
+  } catch (e) {
+    const lines = e.stack.split("\\n").flatMap(frame => frame.match(/rows\\.mjs:(\\d+):\\d+\\)?$/)?.[1] ?? []);
+    frames[name] = e.name + " on " + lines.join(", ");
+  }
+}
+console.log(JSON.stringify(frames));
 `;

@@ -40,6 +40,8 @@ pub(super) struct Rewrites {
     pub(super) replaced_names: FxHashMap<ExprId, ExprId>,
     /// Each `a[key]` that is printed `a.name`. Sorted.
     pub(super) keys_printed_as_names: Vec<ExprId>,
+    /// The first argument of a call and a key in brackets, where the node that is printed for it stands elsewhere than the parser puts the operand: each with that position.
+    pub(super) moved_operands: FxHashMap<ExprId, u32>,
 }
 
 pub(super) struct PrintedTree<'a> {
@@ -72,6 +74,7 @@ pub(super) struct Alignment<'a, 's> {
     returned_initializers: FxHashMap<ExprId, u32>,
     replaced_names: FxHashMap<ExprId, ExprId>,
     keys_printed_as_names: Vec<ExprId>,
+    moved_operands: FxHashMap<ExprId, u32>,
     pending: Vec<(ExprId, Expr)>,
     /// One bit for each expression that has been held against what is printed for it.
     aligned: Vec<u64>,
@@ -168,6 +171,26 @@ pub(in crate::lower) fn find_written_literal(
     })
 }
 
+/// The position that the transpiler's parser gives an expression: that of its first operand, without parentheses.
+pub(in crate::lower) fn parsed_position(hir: &hir::File<'_>, expression: ExprId) -> u32 {
+    let mut first = hir.skip_type_assertions(expression);
+    loop {
+        let next = match hir[first].kind {
+            ExprKind::Binary { left, .. } => left,
+            ExprKind::Cond { test, .. } => test,
+            ExprKind::Assign { target, .. } => target,
+            ExprKind::Index { obj, .. } | ExprKind::Dot { obj, .. } => obj,
+            ExprKind::Call(site) | ExprKind::TaggedTemplate(site) => hir[site].callee,
+            ExprKind::Unary {
+                op: UnOp::PostInc | UnOp::PostDec,
+                operand,
+            } => operand,
+            _ => return hir[first].pos,
+        };
+        first = hir.skip_type_assertions(next);
+    }
+}
+
 fn find_assigned_value(statement: Stmt) -> Option<Expr> {
     let StmtData::SExpr(statement) = statement.data else {
         return None;
@@ -250,6 +273,7 @@ impl<'a, 's> Alignment<'a, 's> {
             returned_initializers: FxHashMap::default(),
             replaced_names: FxHashMap::default(),
             keys_printed_as_names: Vec::new(),
+            moved_operands: FxHashMap::default(),
             pending: Vec::new(),
             aligned: vec![0; parsed.hir.exprs.len() / 64 + 1],
             searches: RefCell::default(),
@@ -287,6 +311,7 @@ impl<'a, 's> Alignment<'a, 's> {
             returned_initializers: self.returned_initializers,
             replaced_names: self.replaced_names,
             keys_printed_as_names: self.keys_printed_as_names,
+            moved_operands: self.moved_operands,
         }
     }
 
@@ -511,24 +536,20 @@ impl<'a, 's> Alignment<'a, 's> {
         matches!(literal, Some(Constant::String(text)) if text == self.atoms.intern(b""))
     }
 
-    /// The position that the parser gives the expression: that of its first operand, without parentheses.
     fn parsed_position(&self, expression: ExprId) -> u32 {
-        let hir = self.hir;
-        let mut first = hir.skip_type_assertions(expression);
-        loop {
-            let next = match hir[first].kind {
-                ExprKind::Binary { left, .. } => left,
-                ExprKind::Cond { test, .. } => test,
-                ExprKind::Assign { target, .. } => target,
-                ExprKind::Index { obj, .. } | ExprKind::Dot { obj, .. } => obj,
-                ExprKind::Call(site) | ExprKind::TaggedTemplate(site) => hir[site].callee,
-                ExprKind::Unary {
-                    op: UnOp::PostInc | UnOp::PostDec,
-                    operand,
-                } => operand,
-                _ => return hir[first].pos,
-            };
-            first = hir.skip_type_assertions(next);
+        parsed_position(self.hir, expression)
+    }
+
+    /// Remembers where the node stands that is printed for an operand, if the parser puts the operand elsewhere.
+    fn note_printed_position(&mut self, operand: ExprId, printed: Loc) {
+        if operand.is_none() {
+            return;
+        }
+        let operand = self.hir.skip_type_assertions(operand);
+        if let Some(position) = position_of(printed)
+            && position != self.parsed_position(operand)
+        {
+            self.moved_operands.insert(operand, position);
         }
     }
 
@@ -924,6 +945,12 @@ impl<'a, 's> Alignment<'a, 's> {
                 if is_same {
                     self.push(site.callee, printed.target);
                     self.push_each(site.args, &printed.args);
+                    // The printer looks for the token in front of the `(` from the first argument that it prints, or from the `)`.
+                    if let Some(first) = hir.ids(site.args).next() {
+                        let printed_first = printed.args.first().map(|argument| argument.loc);
+                        let behind = printed_first.unwrap_or(printed.close_paren_loc);
+                        self.note_printed_position(first, behind);
+                    }
                 }
                 is_same
             }
@@ -967,6 +994,7 @@ impl<'a, 's> Alignment<'a, 's> {
                 self.keys_printed_as_names.push(expression);
                 self.push(obj, printed.target);
                 self.align_literal(index, printed.name.slice(), printed.name_loc);
+                self.note_printed_position(index, printed.name_loc);
                 true
             }
             (ExprKind::Index { obj, index, .. }, ExprData::EIndex(printed)) => {
@@ -974,6 +1002,15 @@ impl<'a, 's> Alignment<'a, 's> {
                 if is_same {
                     self.push(obj, printed.target);
                     self.push(index, printed.index);
+                }
+                // A key that the transpiler has made anew stands where nothing says that this key is printed: between the brackets, behind what is printed for the object.
+                let brackets = hir[obj].end..hir[expression].end;
+                let is_between = |key: u32| brackets.contains(&key);
+                let is_own_key = is_same
+                    || (position_of(printed.index.loc).is_some_and(is_between)
+                        && self.may_be_printed_at(obj, printed.target.loc));
+                if is_own_key {
+                    self.note_printed_position(index, printed.index.loc);
                 }
                 is_same
             }

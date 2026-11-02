@@ -139,4 +139,23 @@ describe("a tag whose template has non-ASCII text", () => {
     expect(JSON.parse(stdout)).toEqual(["é\né\né"]);
     expect(exitCode).toBe(0);
   });
+
+  // The backquote that is printed belongs to the helper's call: no error is reported at it, so it has no mapping.
+  test.concurrent("leaves the frame of a member read behind the template at the dot", async () => {
+    using dir = tempDir("template-literal-tags", {
+      "member.js": [
+        "const nothing = () => undefined;",
+        "try {",
+        "  nothing",
+        "    `é`.member;",
+        "} catch (error) {",
+        "  console.log(/:(\\d+:\\d+)\\)?$/m.exec(error.stack)[1]);",
+        "}",
+      ].join("\n"),
+    });
+    const { stdout, stderr, exitCode } = await run(join(String(dir), "member.js"));
+    expect(stderr).toBe("");
+    expect(stdout).toBe("4:8\n");
+    expect(exitCode).toBe(0);
+  });
 });

@@ -5,13 +5,14 @@
 //   - `bun` runs them, then runs each bundle `Bun.build` made of them: stack traces, call sites, error previews
 //   - the source maps of the bundles are read directly: every word they map has to be the same word in the source
 //   - a compiled executable runs them
+//   - `bun` runs one program as it prints it and as it is written: a frame is on the same line in both
 //   - `Bun.build` says where the programs that do not build are wrong
 import { afterAll, describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isWindows, tempDir } from "harness";
 import { readFileSync } from "node:fs";
 import { SourceMap } from "node:module";
 import { join } from "node:path";
-import { broken, cases, snapshots } from "./source-positions-corpus";
+import { asWritten, broken, cases, snapshots } from "./source-positions-corpus";
 
 type Variant = {
   /** Goes before the code of each line that has some. */
@@ -32,7 +33,8 @@ const variants: Record<string, Variant> = {
   below: { above: 100 },
 };
 
-type Probe = { id: number; file: string; line: number; column: number; text: string };
+/** `above`: how many frames of the file are below the one asked after. `minified`: where a minified bundle has it. */
+type Probe = { id: number; file: string; line: number; column: number; text: string; above: number; minified?: Probe };
 type Program = { file: string; source: string; functions: string; counts: string[]; texts: string[] };
 const probes: Probe[] = [];
 const programs: Program[] = [];
@@ -52,19 +54,22 @@ for (const [variantName, { before = "", above = 0, eol = "\n", bom = false, fina
       texts.push(count === " -" || /^[^/]*\*\//.test(text) ? text : before + text);
     }
 
-    const wanted: { id: number; text: string }[] = [];
+    const wanted: { id: number; text: string; above: number; minified?: string }[] = [];
     const source = (texts.join(eol) + (finalNewline ? eol : "")).replace(
-      /\b(at|ran)(\?\.)?\(\)|\bcaught\(e, "([^"]+)"\)/g,
-      (_, name, optional = "", thrownAt) => {
+      /\b(at|ran)(\?\.)?\(\)|\bcaught\(e, "([^"]+)"(?:, (\d))?(?:, "([^"]+)")?\)/g,
+      (_, name, optional = "", thrownAt, above = "0", minified) => {
         const id = probes.length + wanted.length;
-        wanted.push({ id, text: thrownAt ?? `${name}${optional}(${id})` });
+        wanted.push({ id, text: thrownAt ?? `${name}${optional}(${id})`, above: Number(above), minified });
         return thrownAt ? `caught(${id}, e)` : `${name}${optional}(${id})`;
       },
     );
-    for (const { id, text } of wanted) {
+    const found = (id: number, text: string, above: number): Probe => {
       const index = source.indexOf(text);
       const lineStart = source.lastIndexOf("\n", index) + 1;
-      probes.push({ id, file, text, line: source.slice(0, index).split("\n").length, column: index - lineStart + 1 });
+      return { id, file, text, above, line: source.slice(0, index).split("\n").length, column: index - lineStart + 1 };
+    };
+    for (const { id, text, above, minified } of wanted) {
+      probes.push({ ...found(id, text, above), ...(minified && { minified: found(id, minified, above) }) });
     }
     programs.push({ file, source: (bom ? "\uFEFF" : "") + source, functions, counts, texts: source.split(eol) });
   }
@@ -110,6 +115,13 @@ globalThis.at = function at(id) {
 };
 globalThis.ran = id => void (records[id] ??= { count: 0 }).count++;
 globalThis.caught = (id, error) => void record(id, error);
+globalThis.fails = {
+  self() { return this; },
+  call() { throw new Error("called"); },
+  make() { return fails.call; },
+  tag() { throw new Error("tagged"); },
+  get value() { throw new Error("read"); },
+};
 globalThis.load = specifiers =>
   specifiers.reduce(
     (previous, specifier) => previous.then(() => import(specifier)).catch(e => void (records.failed[specifier] = String(e))),
@@ -182,6 +194,9 @@ const dir = tempDir("source-positions", {
   "entry.ts": programs.map(({ file }) => `import "./${file}";\n`).join(""),
   "compiled.ts": `import "./probe.cjs";\nawait import("./entry.ts");\n`,
   "run.ts": `await load(${JSON.stringify(programs.map(({ file }) => `./${file}`))});\n`,
+  // Bun runs a file whose first line is `// @bun` as it is written. The first line of the other copy is empty.
+  "printed/rows.mjs": asWritten,
+  "written/rows.mjs": "// @bun" + asWritten,
 });
 afterAll(() => dir[Symbol.dispose]());
 const root = String(dir);
@@ -199,6 +214,14 @@ async function run(lane: string, cmd: string[]) {
   if (exitCode !== 0) throw new Error(`${cmd.join(" ")} exited with ${exitCode}\n${stdout}\n${stderr}`);
   Object.assign(lanes, JSON.parse(readFileSync(join(root, out), "utf8")));
   return stderr;
+}
+
+/** What each row of `asWritten` says of its frames, in the copy at `path`. */
+async function framesOf(path: string): Promise<Record<string, string>> {
+  await using proc = Bun.spawn({ cmd: [bunExe(), path], cwd: root, env: bunEnv, stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  if (exitCode !== 0) throw new Error(`${path} exited with ${exitCode}\n${stdout}\n${stderr}`);
+  return JSON.parse(stdout);
 }
 
 async function bundle(name: string) {
@@ -223,7 +246,7 @@ async function bundle(name: string) {
 
 // Everything runs once, here and not in a hook: a hook has the time limit of one test.
 const compiled = join(root, isWindows ? "compiled.exe" : "compiled");
-const [table, { logs: diagnostics }] = await Promise.all([
+const [table, { logs: diagnostics }, printed, written] = await Promise.all([
   run("test", [
     bunExe(),
     "test",
@@ -241,6 +264,8 @@ const [table, { logs: diagnostics }] = await Promise.all([
     entrypoints: Object.keys(broken).flatMap(name => inEachVariant(name, () => {}).map(([file]) => join(root, file))),
     throw: false,
   }),
+  framesOf("./printed/rows.mjs"),
+  framesOf("./written/rows.mjs"),
   run("run", [bunExe(), "--preload=./probe.cjs", "run.ts"]),
   ...Object.keys(builds).map(bundle),
   Bun.build({ entrypoints: [join(root, "compiled.ts")], compile: { outfile: compiled }, sourcemap: "inline" }).then(
@@ -279,14 +304,15 @@ describe.each(["test", "run", ...bundles, "compiled"])("%s", laneName => {
   test.each(Object.keys(variants))("%s: where a call or an error is", variantName => {
     const wrong: Record<string, unknown> = {};
     let checked = 0;
-    for (const { id, file, line, column, text } of probes) {
+    for (const probe of probes) {
+      const { id, file, line, column, text, above } = (laneName === "minified" && probe.minified) || probe;
       if (!file.startsWith(variantName + "/")) continue;
       const said = lanes[laneName][id];
       if (!said?.stack) continue;
       checked++;
       const expected = `${file}:${line}:${column}`;
       const frames = said.stack.split("\n").slice(1).map(position);
-      const frame = frames.findIndex(frame => frame.startsWith(file + ":"));
+      const frame = frames.flatMap((frame, index) => (frame.startsWith(file + ":") ? [index] : []))[above] ?? -1;
       const got = {
         stack: frames[frame],
         ...(said.callSite && { callSite: position(said.callSite), getCallSites: position(said.getCallSites) }),
@@ -305,6 +331,165 @@ describe.each(["test", "run", ...bundles, "compiled"])("%s", laneName => {
     expect(wrong).toEqual({});
     expect(checked).toBeGreaterThan(0);
   });
+});
+
+// Joined into one pattern, the two would throw "Cannot destructure property 'x'" from the line of the second.
+test("declarations next to each other are not joined at run time", () => {
+  const { id } = probes.find(({ file, text }) => file === "plain/declarations.ts" && text === "o.x")!;
+  expect(lanes.run[id].stack).toStartWith("TypeError: undefined is not an object (evaluating 'o.x')\n");
+});
+
+// The rows of `asWritten` that have a frame on another line than as it is written: what is on both lines, and why.
+const notAsWritten: Record<string, { printed: string; written: string; why: string }> = {
+  of: {
+    printed: "for (const each",
+    written: "of 1) void each;",
+    why: "the `of` is not mapped: an `--aot` executable cannot quote the head of a loop from a frame at its `of`",
+  },
+  memberOfName: {
+    printed: "nothing",
+    written: ".member;",
+    why: "the `.` behind a name is not mapped: a name that is not declared is reported where that `.` is printed",
+  },
+  indexOfName: {
+    printed: "nothing",
+    written: "[0];",
+    why: "the `[` behind a name is not mapped, for the same reason",
+  },
+  tagOfName: {
+    printed: "tag",
+    written: "`tagged`;",
+    why: "the backquote behind a name is not mapped, for the same reason",
+  },
+  lastArgument: {
+    printed: ");",
+    written: "notDeclared",
+    why: "a name is reported where it ends, and the `)` that is printed there is a line down",
+  },
+  spread: {
+    printed: "1);",
+    written: "String(...",
+    why: "a spread is reported behind its `...`, where what it spreads is printed",
+  },
+  construct: {
+    printed: "new",
+    written: "empty.missing();",
+    why: "`new` of what is no constructor is at the `new` once printed, and where its callee ends as written",
+  },
+  membersOfOneObject: {
+    printed: "second = nothing.y;",
+    written: "const first = nothing.x,",
+    why: "one declaration that takes two members of an object is printed as one pattern",
+  },
+  commentAboveCallOfFunction: {
+    printed: "fails.call();",
+    written: "})",
+    why: "the end of a callee is not looked for across a line comment",
+  },
+};
+
+test("a frame is on the line it is on when the program runs as it is written", () => {
+  expect(asWritten).toMatch(/^[\x00-\x7f]+$/);
+  const rows = Object.keys(written);
+  expect(Object.keys(printed)).toEqual(rows);
+  expect(Object.values(written)).not.toContain("did not throw");
+
+  const text = asWritten.split("\n");
+  const shown = (line: number) => `${line}: ${text[line - 1]?.trim()}`;
+  /** The frames of `said` that the other copy has on another line. */
+  const elsewhere = (said: string, other: string) => {
+    const others = other.split(/ on |, /);
+    const frames = said.split(/ on |, /).filter((frame, index) => frame !== others[index]);
+    return frames.map(frame => (Number(frame) ? shown(Number(frame)) : frame)).join(", ");
+  };
+  /** The one line of a row that has `line` on it and nothing else. */
+  const lineOf = (row: string, line: string) => {
+    const name = text.findIndex(each => new RegExp(`^  (async )?${row}\\(.*\\{$`).test(each));
+    const end = text.indexOf("  },", name);
+    const found = text.flatMap((each, index) =>
+      name < index && index < end && each.trim() === line ? [index + 1] : [],
+    );
+    return name >= 0 && found.length === 1 ? shown(found[0]) : `${row} has not one line that is ${line}`;
+  };
+  expect(
+    Object.fromEntries(
+      rows
+        .filter(row => printed[row] !== written[row])
+        .map(row => [
+          row,
+          { printed: elsewhere(printed[row], written[row]), written: elsewhere(written[row], printed[row]) },
+        ]),
+    ),
+  ).toEqual(
+    Object.fromEntries(
+      Object.entries(notAsWritten).map(([row, lines]) => [
+        row,
+        { printed: lineOf(row, lines.printed), written: lineOf(row, lines.written) },
+      ]),
+    ),
+  );
+});
+
+// A bundle prints the name `Late` for `late.Late`. A name that is read too early is reported where it ends: a token mapped there would take its frame.
+test("no token is mapped behind a member of an import that a bundle prints as a name", async () => {
+  const reads = `import { late } from "./barrel.mjs";
+export function read() {
+  const rows = [
+    () => {
+      late.Late
+        .member;
+    },
+    () => {
+      late.Late
+        [0];
+    },
+    () => {
+      late.Late
+        \`tagged\`;
+    },
+    () => {
+      late["Late"]
+        .member;
+    },
+  ];
+  const frames = rows.map(row => {
+    try {
+      row();
+      return "did not throw";
+    } catch (e) {
+      return e.name + " on " + /reads\\.mjs:(\\d+):\\d+\\)?$/m.exec(e.stack)?.[1];
+    }
+  });
+  console.log(JSON.stringify(frames));
+}
+`;
+  using files = tempDir("source-positions-bound-import", {
+    "entry.mjs": `import "./reads.mjs";\n`,
+    "barrel.mjs": `export * as late from "./late.mjs";\n`,
+    // `read()` runs before the class is there.
+    "late.mjs": `import { read } from "./reads.mjs";\nread();\nexport class Late {}\n`,
+    "reads.mjs": reads,
+  });
+  const folder = String(files);
+  const built = await Bun.build({
+    entrypoints: [join(folder, "entry.mjs")],
+    outdir: join(folder, "out"),
+    target: "bun",
+    sourcemap: "inline",
+  });
+  expect(built.success).toBe(true);
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), join(folder, "out", "entry.js")],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect(stderr).toBe("");
+  const names = reads.split("\n").flatMap((line, index) => (/^ +late\W+Late\W*$/.test(line) ? [index + 1] : []));
+  expect(JSON.parse(stdout)).toEqual(names.map(line => `ReferenceError on ${line}`));
+  expect(names).toHaveLength(4);
+  expect(exitCode).toBe(0);
 });
 
 describe("bun test --coverage", () => {

@@ -848,6 +848,8 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
         );
         template.tag =
             Some(self.call_runtime(expr.loc, b"__rawTemplate", ExprNodeList::init_one(raw)));
+        // The backquote now stands behind a made-up tag, where no frame is reported: it gets no mapping.
+        template.head_loc = bun_ast::Loc::EMPTY;
         Some(self.new_expr(
             E::Call {
                 target: tag,

@@ -4302,7 +4302,9 @@ const d = b + a;
 console.log(a, b, c, d);
         `,
         `
-const c = "ba", b = c + "a", d = b + "a";
+const c = "ba";
+const b = c + "a";
+const d = b + "a";
 console.log("a", b, c, d);
         `.trim(),
       );
@@ -4354,7 +4356,8 @@ hey();
         console.log(foo, array);
         `,
         `
-const foo = { bar: !0 }, array = [1];
+const foo = { bar: !0 };
+const array = [1];
 console.log(foo, array);
           `.trim(),
       );
@@ -4477,9 +4480,9 @@ console.log(foo, array);
       check("let x = 1; delete x", "let x = 1;\ndelete x;");
 
       // Cannot substitute into mutating binary operators unless immediately after the assignment
-      check("let x = 1; let y; x = 2", "let x = 1, y;\nx = 2;");
-      check("let x = 1; let y; x += 2", "let x = 1, y;\nx += 2;");
-      check("let x = 1; let y; x ||= 2", "let x = 1, y;\nx ||= 2;");
+      check("let x = 1; let y; x = 2", "let x = 1;\nlet y;\nx = 2;");
+      check("let x = 1; let y; x += 2", "let x = 1;\nlet y;\nx += 2;");
+      check("let x = 1; let y; x ||= 2", "let x = 1;\nlet y;\nx ||= 2;");
 
       // Can substitute past mutating binary operators when the left operand has no side effects
       // check("let x = 1; arg0 = x", "arg0 = 1;");
@@ -4926,10 +4929,10 @@ console.log(foo, array);
         expect(transpiler.transformSync(input)).toEqual(output);
       }
 
-      var output = `var boop = "bcd";\nconst ropy = "a" + boop + "d", ropy2 = "b" + boop;\n`;
+      var output = `var boop = "bcd";\nconst ropy = "a" + boop + "d";\nconst ropy2 = "b" + boop;\n`;
       check(`var boop = ('b' + 'c') + 'd'; const ropy = "a" + boop + 'd'; const ropy2 = 'b' + boop;`, output);
 
-      output = `var boop = "fbcd", ropy = "a" + boop + "d", ropy2 = "b" + (ropy + "d");\n`;
+      output = `var boop = "fbcd";\nvar ropy = "a" + boop + "d";\nvar ropy2 = "b" + (ropy + "d");\n`;
       check(`var boop = "f" + ("b" + "c") + "d";var ropy = "a" + boop + "d";var ropy2 = "b" + (ropy + "d")`, output);
 
       expectPrinted("'string' + `template`", `"stringtemplate"`);
@@ -6587,8 +6590,11 @@ describe("same-target destructuring with a re-declared target", () => {
     );
   });
 
-  it("keeps a run that rebinds an earlier var after the statements merge", () => {
+  it("keeps a run that rebinds an earlier var", () => {
     expect(minifier.transformSync("function f() { var n = L; var n = n.next, n = n.next; return n; }")).toBe(
+      "function f(){var n=L;var n=n.next,n=n.next;return n}",
+    );
+    expect(minifier.transformSync("function f() { var n = L, n = n.next, n = n.next; return n; }")).toBe(
       "function f(){var n=L,n=n.next,n=n.next;return n}",
     );
     expect(minifier.transformSync("function f() { for (var n = L, n = n.next, n = n.next; ; ) return n; }")).toBe(
@@ -6601,6 +6607,9 @@ describe("same-target destructuring with a re-declared target", () => {
       "function f(o) {\n  var { a, b } = o;\n  return [a, b];\n}\n",
     );
     expect(minifier.transformSync("function f() { var o = M; var a = o.a, b = o.b; return [a, b]; }")).toBe(
+      "function f(){var o=M;var{a,b}=o;return[a,b]}",
+    );
+    expect(minifier.transformSync("function f() { var o = M, a = o.a, b = o.b; return [a, b]; }")).toBe(
       "function f(){var o=M,{a,b}=o;return[a,b]}",
     );
   });
@@ -6692,6 +6701,9 @@ describe("same-target destructuring with an unstable target", () => {
       "function f(o) {\n  var a = o.a, b = o.b;\n  for (o of N)\n    ;\n  return [a, b];\n}\n",
     );
     expect(minifier.transformSync("var o = M; var a = o.a, b = o.b; o = N; console.log(a, b);")).toBe(
+      "var o=M;var a=o.a,b=o.b;o=N;console.log(a,b);",
+    );
+    expect(minifier.transformSync("var o = M, a = o.a, b = o.b; o = N; console.log(a, b);")).toBe(
       "var o=M,a=o.a,b=o.b;o=N;console.log(a,b);",
     );
   });
@@ -6786,6 +6798,9 @@ describe("same-target destructuring with an unstable target", () => {
       "function f() {\n  var { cos: a, sin: b } = Math;\n  return [a, b];\n}\n",
     );
     expect(minifier.transformSync("var o = M; var a = o.a, b = o.b; console.log(a, b);")).toBe(
+      "var o=M;var{a,b}=o;console.log(a,b);",
+    );
+    expect(minifier.transformSync("var o = M, a = o.a, b = o.b; console.log(a, b);")).toBe(
       "var o=M,{a,b}=o;console.log(a,b);",
     );
   });

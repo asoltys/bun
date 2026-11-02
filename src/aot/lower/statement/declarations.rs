@@ -27,7 +27,7 @@ impl FileLowering<'_, '_, '_, '_> {
         match decl.init.some() {
             Some(initializer) => self.last_mapped_position(initializer),
             None => self
-                .last_mapped_pattern_position(decl.pat)
+                .last_mapped_pattern_position(decl.pat, Some(before))
                 .unwrap_or(before),
         }
     }
@@ -139,7 +139,7 @@ impl FunctionLowering<'_, '_, '_, '_, '_> {
         }
     }
 
-    // Bun's transpiler prints `const a = o.x; const b = o.y;` as `const { x: a, y: b } = o;`, and a pattern tests its value by itself, ahead of the reads.
+    // Bun's transpiler prints `const a = o.x, b = o.y;` as `const { x: a, y: b } = o;`, and a pattern tests its value by itself, ahead of the reads.
     fn test_object_of_printed_pattern(&mut self, initializer: ExprId) {
         let hir = self.file.hir;
         let ExprKind::Dot { obj, name, .. } = hir[self.file.skip_type_syntax(initializer)].kind

@@ -7,9 +7,7 @@ pub(in crate::lower) use substitution::Printed;
 
 use bun_sema::bind::ScopeId;
 use bun_sema::fold::is_removed_where_never_run;
-use bun_sema::hir::{
-    ExprId, ExprKind, Flags, FnBody, FnId, IdList, PatKind, StmtId, StmtKind, VarKind,
-};
+use bun_sema::hir::{ExprId, ExprKind, FnBody, FnId, IdList, PatKind, StmtId, StmtKind, VarKind};
 
 use super::control::BreakTargetKind;
 use super::{FileLowering, FunctionLowering, commonjs, dispose, module};
@@ -31,9 +29,6 @@ impl FunctionLowering<'_, '_, '_, '_, '_> {
                 self.lower_statements_with_resources(rest);
                 return;
             }
-            let earlier = IdList::new(statements.start, index);
-            self.joined_declarations_end =
-                self.file.find_joined_declarations_end(earlier, statement);
             self.file.queries.note_idle_between_statements();
             self.lower_statement(statement);
         }
@@ -102,7 +97,7 @@ impl FunctionLowering<'_, '_, '_, '_, '_> {
             return;
         }
         let stmt = self.file.hir[statement];
-        let joined_declarations_end = self.joined_declarations_end.take();
+        let mapped_before_loop_head = self.mapped_before_loop_head.take();
         if !self.enter_nesting(stmt.start) {
             return;
         }
@@ -129,7 +124,7 @@ impl FunctionLowering<'_, '_, '_, '_, '_> {
             }
             StmtKind::Var(declarations) => {
                 let has_pattern = self.file.declares_pattern(statement);
-                let mut mapped = joined_declarations_end.unwrap_or(stmt.start);
+                let mut mapped = mapped_before_loop_head.unwrap_or(stmt.start);
                 for declaration in declarations.iter() {
                     self.lower_variable_declaration(declaration, mapped);
                     if has_pattern && !self.file.is_initializer_moved(declaration) {
@@ -395,7 +390,8 @@ impl FileLowering<'_, '_, '_, '_> {
             StmtKind::Var(declarations) => {
                 let last = declarations.iter().last()?;
                 let is_var = self.bound.variable_kind(hir, last) == VarKind::Var;
-                self.last_mapped_pattern_position(is_var.then_some(hir[last].pat)?)
+                // What is never reached is printed as the names that it declares.
+                self.last_mapped_pattern_position(is_var.then_some(hir[last].pat)?, None)
             }
             _ => None,
         });
@@ -535,41 +531,5 @@ impl FileLowering<'_, '_, '_, '_> {
             .iter()
             .map(|declaration| hir[hir[declaration].pat].kind);
         patterns.any(|pattern| matches!(pattern, PatKind::Object(_) | PatKind::Array(_)))
-    }
-
-    // `const a = f(); const [b] = c;` is printed `const a = f(), [b] = c;`.
-    fn find_joined_declarations_end(
-        &self,
-        earlier: IdList<StmtId>,
-        statement: StmtId,
-    ) -> Option<u32> {
-        let hir = self.hir;
-        let head_of = |statement: StmtId| match hir[statement].kind {
-            StmtKind::Var(declarations) => declarations.iter().next().map(|head| hir[head]),
-            _ => None,
-        };
-        if !self.declares_pattern(statement) {
-            return None;
-        }
-        let head = head_of(statement)?;
-        let previous = hir
-            .ids(earlier)
-            .rev()
-            .find(|&earlier| self.is_printed(earlier))?;
-        let previous_head = head_of(previous)?;
-        let is_exported = |flags: Flags| flags.contains(Flags::EXPORT);
-        let is_ambient = previous_head.flags.contains(Flags::AMBIENT);
-        if is_ambient
-            || previous_head.kind != head.kind
-            || is_exported(previous_head.flags) != is_exported(head.flags)
-        {
-            return None;
-        }
-        let StmtKind::Var(declarations) = hir[previous].kind else {
-            return None;
-        };
-        let mut declarations = declarations.iter().rev();
-        let last = declarations.find(|&last| !self.is_initializer_moved(last))?;
-        Some(self.last_mapped_declaration_position(last, hir[previous].start))
     }
 }

@@ -2263,6 +2263,58 @@ describe.concurrent("--react-compiler", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  // A tag is called at its backquote: the compiler's output keeps where that was written, also in a file with CRLF.
+  test("a tagged template in a compiled function is reported at its backquote", async () => {
+    const tagged = [
+      "const holder = { nothing: undefined, make() {} };",
+      "export function Call(props) {",
+      "  const made = holder.make(",
+      "    props.x",
+      "  )",
+      "    `plain",
+      "    text`;",
+      "  return <div>{made}</div>;",
+      "}",
+      "export function Member(props) {",
+      "  const made = holder",
+      "    .nothing",
+      "    `more",
+      "    text`;",
+      "  return <div>{made}</div>;",
+      "}",
+    ];
+    const result = await compiled(
+      {
+        "src/TaggedLF.jsx": tagged.join("\n"),
+        "src/TaggedCRLF.jsx": tagged.join("\r\n"),
+        "compiled.test.tsx": `
+          import { test } from "bun:test";
+          import * as TaggedCRLF from "./src/TaggedCRLF";
+          import * as TaggedLF from "./src/TaggedLF";
+          test("where the tags are called", () => {
+            const frames = [];
+            for (const [file, all] of Object.entries({ TaggedLF, TaggedCRLF })) {
+              for (const name of Object.keys(all).filter(name => /\\$\\[\\d+\\]/.test(String(all[name])))) {
+                try {
+                  all[name]({ x: 1 });
+                } catch (error) {
+                  const frame = error.stack.split("\\n").find(line => line.includes(file + ".jsx"));
+                  frames.push(file + " " + name + " " + /:(\\d+:\\d+)\\)?$/.exec(frame)?.[1]);
+                }
+              }
+            }
+            console.log("compiled: " + frames.join(", "));
+          });
+        `,
+      },
+      ["--react-compiler"],
+    );
+    expect(result.compiled).toBe(
+      "TaggedLF Call 6:5, TaggedLF Member 13:5, TaggedCRLF Call 6:5, TaggedCRLF Member 13:5",
+    );
+    expect(result.exitCode).toBe(0);
+  });
+
   test.each([
     `reactCompiler = 1`,
     `reactCompiler = [1]`,

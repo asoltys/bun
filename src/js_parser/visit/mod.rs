@@ -2051,7 +2051,8 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
 
                 StmtData::SLocal(local) => {
                     // Merge adjacent local statements
-                    if output.len() > 0 {
+                    if output.len() > 0 && p.options.runtime_merge_adjacent_expression_statements()
+                    {
                         let prev_idx = output.len() - 1;
                         let prev_stmt = &mut output[prev_idx];
                         if let StmtData::SLocal(mut prev_local) = prev_stmt.data {
@@ -2089,7 +2090,11 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                             //
                             // This doesn't handle every case. Only the very simple one.
                             if let ExprData::EBinary(bin_assign) = s_expr.value.data {
+                                // Not where bundling merges `var f;` into the declaration before it: the store stays a store there, and so here.
+                                let follows_joinable = prev_idx > 0
+                                    && matches!(output[prev_idx - 1].data, StmtData::SLocal(before) if prev_local.can_merge_with(&before));
                                 if prev_local.decls.len_u32() == 1
+                                    && !follows_joinable
                                     && bin_assign.op == OpCode::BinAssign
                                     // we can only do this with var because var is hoisted
                                     // the statement we are merging into may use the statement before its defined.
