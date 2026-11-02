@@ -1,4 +1,5 @@
 #include "HandleScopeBuffer.h"
+#include "GlobalHandleRegistry.h"
 #include "GlobalInternals.h"
 #include "../v8_handle_scope_data.h"
 #include <wtf/TZoneMallocInlines.h>
@@ -17,7 +18,10 @@ HandleScopeBuffer::HandleScopeBuffer(Bun::HandleScopeImpl* owner, Isolate* isola
     m_savedLimit = data->limit;
 }
 
-HandleScopeBuffer::~HandleScopeBuffer() = default;
+NEVER_INLINE void HandleScopeBuffer::leaveGlobalHandleLists()
+{
+    m_globalHandleLists->registry.didDestroyBuffer(*m_globalHandleLists, WTF::move(m_storage));
+}
 
 JSC::VM& HandleScopeBuffer::vm() const
 {
@@ -186,6 +190,14 @@ TaggedPointer* HandleScopeBuffer::createHandleFromExistingObject(TaggedPointer a
                     reinterpret_cast<Oddball*>(v8_object)->kind());
             }
         }
+        if (v8_object->map()->m_instanceType == InstanceType::HeapNumber) {
+            if (reuseHandle) {
+                *reuseHandle = Handle(v8_object->asDouble());
+                return reuseHandle->slot();
+            } else {
+                return createDoubleHandle(v8_object->asDouble());
+            }
+        }
         if (reuseHandle) {
             *reuseHandle = Handle(v8_object->map(), v8_object->asCell(), vm(), m_owner);
             return reuseHandle->slot();
@@ -193,6 +205,25 @@ TaggedPointer* HandleScopeBuffer::createHandleFromExistingObject(TaggedPointer a
             return createHandle(v8_object->asCell(), v8_object->map(), vm());
         }
     }
+}
+
+TaggedPointer* HandleScopeBuffer::createGlobalHandle(TaggedPointer address)
+{
+    if (!m_globalHandleLists) {
+        m_globalHandleLists = new GlobalHandleLists(GlobalHandleRegistry::ensure(vm()), this);
+    }
+    auto& lists = *m_globalHandleLists;
+    Handle* handle = lists.free.isEmpty() ? &createEmptyHandle() : lists.free.takeLast();
+    {
+        WTF::Locker locker { m_owner->cellLock() };
+        TaggedPointer* slot = createHandleFromExistingObject(address, handle);
+        if (slot != handle->slot()) {
+            // undefined, null, true or false: the handle holds the root's word, so that the v8::Global has an address that the registry knows.
+            *handle->slot() = *slot;
+        }
+    }
+    lists.registry.add(handle, lists);
+    return handle->slot();
 }
 
 void HandleScopeBuffer::close(Bun::HandleScopeImpl* parent)
@@ -210,6 +241,9 @@ void HandleScopeBuffer::close(Bun::HandleScopeImpl* parent)
     // the frame is read.
     if (parent && !internals->activeReturnValueSlots().isEmpty()) {
         evacuateActiveReturnValues(parent);
+    }
+    if (internals->hasDisposedGlobalHandles()) [[unlikely]] {
+        GlobalHandleRegistry::didCloseScope(vm());
     }
     // The owner detaches this buffer and then frees it, along with every handle.
 }

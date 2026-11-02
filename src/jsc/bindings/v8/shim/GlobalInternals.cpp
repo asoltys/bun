@@ -2,6 +2,7 @@
 
 #include "../V8ObjectTemplate.h"
 #include "InternalFieldObject.h"
+#include "GlobalHandleRegistry.h"
 #include "HandleScopeBuffer.h"
 #include "../V8FunctionTemplate.h"
 #include "../V8Function.h"
@@ -49,6 +50,7 @@ void GlobalInternals::finishCreation(VM& vm)
     m_globalHandles.initLater([](const LazyProperty<GlobalInternals, Bun::HandleScopeImpl>::Initializer& init) {
         init.set(Bun::HandleScopeImpl::create(init.vm, init.owner->m_globalObject->HandleScopeImplStructure(), nullptr));
     });
+    GlobalHandleRegistry::ensure(vm).addRealm(this);
 }
 
 template<typename Visitor>

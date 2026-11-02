@@ -4,6 +4,7 @@
 #include "V8Data.h"
 #include "V8Value.h"
 #include "shim/HandleScopeBuffer.h"
+#include "shim/GlobalHandleRegistry.h"
 #include "shim/GlobalInternals.h"
 #include "shim/Function.h"
 #include "shim/FunctionTemplate.h"
@@ -17,9 +18,13 @@ namespace v8 {
 
 namespace api_internal {
 
-static WTF::HashMap<uintptr_t*, void*>& weakHandleParameters()
+// Null on a thread that has no VM, after the thread's VM is destroyed, and in a VM that has not used the V8 API. Reads no cell: finalizers call this while the heap shuts down.
+static shim::GlobalHandleRegistry* currentGlobalHandleRegistry()
 {
-    return Isolate::GetCurrent()->globalInternals()->weakHandleParameters();
+    auto* globalObject = defaultGlobalObject();
+    if (!globalObject)
+        return nullptr;
+    return shim::GlobalHandleRegistry::ifExists(static_cast<JSC::JSCell*>(globalObject)->vm());
 }
 
 void ToLocalEmpty()
@@ -36,15 +41,14 @@ uintptr_t* GlobalizeReference(internal::Isolate* i_isolate, uintptr_t address)
 {
     auto* isolate = reinterpret_cast<Isolate*>(i_isolate);
     auto* globalHandles = isolate->globalInternals()->globalHandles();
-    TaggedPointer* newSlot = globalHandles->createHandleFromExistingObject(TaggedPointer::fromRaw(address));
+    TaggedPointer* newSlot = globalHandles->createGlobalHandle(TaggedPointer::fromRaw(address));
     return newSlot->asRawPtrLocation();
 }
 
 void DisposeGlobal(uintptr_t* location)
 {
-    if (location) weakHandleParameters().remove(location);
-    // TODO free up a slot in the handle scope
-    (void)location;
+    if (!location) return;
+    if (auto* registry = currentGlobalHandleRegistry()) registry->dispose(reinterpret_cast<shim::Handle*>(location));
 }
 
 void MakeWeak(uintptr_t* location, void* data, WeakCallbackInfo<void>::Callback weak_callback, WeakCallbackType type)
@@ -55,13 +59,14 @@ void MakeWeak(uintptr_t* location, void* data, WeakCallbackInfo<void>::Callback 
     (void)weak_callback;
     (void)type;
     if (!location) return;
-    weakHandleParameters().set(location, data);
+    if (auto* registry = currentGlobalHandleRegistry()) registry->setWeakParameter(reinterpret_cast<shim::Handle*>(location), data);
 }
 
 void* ClearWeak(uintptr_t* location)
 {
     if (!location) return nullptr;
-    return weakHandleParameters().take(location);
+    auto* registry = currentGlobalHandleRegistry();
+    return registry ? registry->takeWeakParameter(reinterpret_cast<shim::Handle*>(location)) : nullptr;
 }
 
 void MoveGlobalReference(uintptr_t** from, uintptr_t** to)

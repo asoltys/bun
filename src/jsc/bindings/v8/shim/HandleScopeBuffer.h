@@ -13,6 +13,9 @@
 namespace v8 {
 namespace shim {
 
+class GlobalHandleRegistry;
+struct GlobalHandleLists;
+
 // Stores the V8 handles for one Bun::HandleScopeImpl, which owns this and attaches it on the first
 // V8 call inside the scope. v8::Locals point to the handles, so a SegmentedVector keeps their
 // addresses stable. The owning scope visits the handles, and mutations must lock its cellLock().
@@ -21,7 +24,12 @@ class HandleScopeBuffer {
 
 public:
     HandleScopeBuffer(Bun::HandleScopeImpl* owner, Isolate* isolate);
-    ~HandleScopeBuffer();
+    ~HandleScopeBuffer()
+    {
+        if (m_globalHandleLists) [[unlikely]] {
+            leaveGlobalHandleLists();
+        }
+    }
 
     template<typename T> Local<T> createLocal(JSC::VM& vm, JSC::JSValue value)
     {
@@ -79,6 +87,9 @@ public:
     // returns the location of the new handle's V8 object pointer or Smi
     TaggedPointer* createHandleFromExistingObject(TaggedPointer address, Handle* reuseHandle = nullptr);
 
+    // For GlobalInternals::globalHandles() only. The handle is live until the VM's GlobalHandleRegistry disposes it.
+    TaggedPointer* createGlobalHandle(TaggedPointer address);
+
     // Called when the owning scope is closing and about to free this. Restores the isolate's
     // HandleScopeData and moves any handle a live callback return value still points to into `parent`.
     void close(Bun::HandleScopeImpl* parent);
@@ -94,6 +105,8 @@ public:
     }
 
 private:
+    friend class GlobalHandleRegistry;
+
     Bun::HandleScopeImpl* m_owner;
     Isolate* m_isolate;
     WTF::SegmentedVector<Handle, 16> m_storage;
@@ -104,6 +117,8 @@ private:
     // close() restores them so they never point into freed handles.
     uintptr_t* m_savedNext;
     uintptr_t* m_savedLimit;
+    // Null except in GlobalInternals::globalHandles(), once it has made a handle. The VM's GlobalHandleRegistry deletes it.
+    GlobalHandleLists* m_globalHandleLists { nullptr };
 
     JSC::VM& vm() const;
     Handle& createEmptyHandle();
@@ -117,6 +132,8 @@ private:
     TaggedPointer appendRescuedLayout(const ObjectLayout& layout);
 
     void evacuateActiveReturnValues(Bun::HandleScopeImpl* parent);
+
+    void leaveGlobalHandleLists();
 };
 
 } // namespace shim
