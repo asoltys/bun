@@ -1,13 +1,16 @@
 //! The imports that the dynamic loader has left unbound in an ELF object that it has mapped into this process.
 
 use core::ffi::CStr;
-use core::mem::size_of;
+use core::mem::{align_of, size_of};
 use core::slice;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use bun_core::AnyBitPattern;
 use bun_sys::elf::PT_LOAD;
 
 const PT_DYNAMIC: u32 = 2;
+const PT_GNU_RELRO: u32 = 0x6474_e552;
+const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 const DT_NULL: i64 = 0;
 const DT_PLTRELSZ: i64 = 2;
@@ -51,7 +54,7 @@ struct Elf64_Dyn {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Elf64_Rela {
-    _r_offset: u64,
+    r_offset: u64,
     r_info: u64,
     _r_addend: i64,
 }
@@ -108,6 +111,8 @@ pub enum Unreadable {
     SymbolIndex,
     /// The name of a symbol does not end inside `DT_STRSZ`.
     SymbolName,
+    /// The slot of an import that the host binds is not a pointer inside the ranges that the loader leaves writable.
+    Slot,
 }
 
 /// A table of the object: `room` is the bytes from `address` to the end of the table, or of the `PT_LOAD` range around it.
@@ -147,10 +152,11 @@ struct Image<'a> {
 }
 
 impl Image<'_> {
-    fn room(&self, address: usize) -> usize {
+    /// The bytes from `address` to the end of the range around it, of the `kind` headers that have `flags`.
+    fn room(&self, kind: u32, flags: u32, address: usize) -> usize {
         self.headers
             .iter()
-            .filter(|header| header.p_type == PT_LOAD && header.p_flags & PF_R != 0)
+            .filter(|header| header.p_type == kind && header.p_flags & flags == flags)
             .find_map(|header| {
                 let start = self.base.wrapping_add(header.p_vaddr as usize);
                 (header.p_memsz as usize)
@@ -166,9 +172,16 @@ impl Image<'_> {
             .into_iter()
             .map(|address| Table {
                 address,
-                room: self.room(address),
+                room: self.room(PT_LOAD, PF_R, address),
             })
             .find(|table| table.room != 0)
+    }
+
+    /// The loader makes `PT_GNU_RELRO` read-only once it has relocated the object.
+    fn has_writable_pointer(&self, address: usize) -> bool {
+        address.is_multiple_of(align_of::<usize>())
+            && self.room(PT_LOAD, PF_R | PF_W, address) >= size_of::<usize>()
+            && self.room(PT_GNU_RELRO, 0, address) == 0
     }
 
     /// The version that the object names for its import `symbol`. A version table that is missing or malformed names none.
@@ -213,11 +226,12 @@ struct Versions {
     needed_count: u64,
 }
 
-/// The first import that the loader has left unbound and that `is_defined` rejects by its name and then by the version that the object names for it, of an object whose loader keeps `headers` mapped at `base`. `defers_got` is for musl, which leaves a `GLOB_DAT` import unbound too.
-pub unsafe fn unresolved_lazy_import<'a>(
+/// Hands the name and the slot of each import that the loader has left unbound to `takes`, and returns the first that it does not take and that `is_defined` rejects by its name and then by the version that the object names for it. The loader keeps `headers` mapped at `base`, and `defers_got` is for musl, which leaves a `GLOB_DAT` import unbound too.
+unsafe fn each_lazy_import<'a>(
     headers: &'a [libc::Elf64_Phdr],
     base: usize,
     defers_got: bool,
+    mut takes: impl FnMut(&'a CStr, usize) -> bool,
     mut is_defined: impl FnMut(&CStr, Option<&CStr>) -> bool,
 ) -> Result<Option<&'a CStr>, Unreadable> {
     let image = Image { headers, base };
@@ -228,7 +242,9 @@ pub unsafe fn unresolved_lazy_import<'a>(
     let address = base.wrapping_add(dynamic.p_vaddr as usize);
     let entries = Table {
         address,
-        room: image.room(address).min(dynamic.p_memsz as usize),
+        room: image
+            .room(PT_LOAD, PF_R, address)
+            .min(dynamic.p_memsz as usize),
     };
 
     // `rela_plt` is the table of `DT_JMPREL`, and `rela_dyn` that of `DT_RELA`, which is read only for musl.
@@ -306,7 +322,8 @@ pub unsafe fn unresolved_lazy_import<'a>(
         let name = strings
             .string(symbol.st_name as usize)
             .ok_or(Unreadable::SymbolName)?;
-        if is_defined(name, None) {
+        let slot = base.wrapping_add(relocation.r_offset as usize);
+        if takes(name, slot) || is_defined(name, None) {
             continue;
         }
         // The loader binds by the version that the object names, and a lookup by the name alone misses a definition that is kept only under an old version.
@@ -318,11 +335,105 @@ pub unsafe fn unresolved_lazy_import<'a>(
     Ok(None)
 }
 
+/// The first import that the loader has left unbound and that `is_defined` rejects by its name and then by the version that the object names for it, of an object whose loader keeps `headers` mapped at `base`. `defers_got` is for musl, which leaves a `GLOB_DAT` import unbound too.
+pub unsafe fn unresolved_lazy_import<'a>(
+    headers: &'a [libc::Elf64_Phdr],
+    base: usize,
+    defers_got: bool,
+    is_defined: impl FnMut(&CStr, Option<&CStr>) -> bool,
+) -> Result<Option<&'a CStr>, Unreadable> {
+    // SAFETY: the caller keeps the object of `headers` loaded at `base`.
+    unsafe { each_lazy_import(headers, base, defers_got, |_, _| false, is_defined) }
+}
+
+/// A library that the host has inside it and does not export, whose functions an addon can import from the host.
+pub struct HostLibrary<'library> {
+    /// The name of every function that the library exports.
+    pub api: &'library [&'library CStr],
+    /// The functions that the host binds, with their addresses.
+    pub functions: &'library [(&'library CStr, usize)],
+}
+
+/// A function of the host, and the slot through which a loaded object calls its import of that name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Binding {
+    slot: usize,
+    function: usize,
+}
+
+impl Binding {
+    /// Makes the object call the host's function. The object that `resolve_lazy_imports` read must still be loaded.
+    pub unsafe fn store(self) {
+        // SAFETY: `resolve_lazy_imports` found the slot aligned and inside a range that the loader keeps writable.
+        let slot = unsafe { AtomicUsize::from_ptr(self.slot as *mut usize) };
+        // Loads of one library in several Workers store the same value here at the same time, while other threads call through the slot.
+        if slot.load(Ordering::SeqCst) != self.function {
+            slot.store(self.function, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Where the lazily bound function imports of an object resolve.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Imports<'a> {
+    /// Every import has a definition, once each of these is stored.
+    Resolved(Vec<Binding>),
+    /// Nothing that the object may bind to defines this import.
+    Unresolved(&'a CStr),
+}
+
+/// Decides where the lazily bound function imports of an object resolve, and stores nothing: a function of `library` in the object's own tree (`in_own_tree`) or in the host, any other where `is_defined` finds it by its name or by the version that the object names for it.
+pub unsafe fn resolve_lazy_imports<'a>(
+    headers: &'a [libc::Elf64_Phdr],
+    base: usize,
+    library: &HostLibrary<'_>,
+    mut in_own_tree: impl FnMut(&CStr) -> bool,
+    is_defined: impl FnMut(&CStr, Option<&CStr>) -> bool,
+) -> Result<Imports<'a>, Unreadable> {
+    let image = Image { headers, base };
+    let mut bindings = Vec::new();
+    let (mut own, mut not_own, mut not_bound, mut writable) = (false, None, None, true);
+    // A function of the library is decided by its name alone, whatever version the object names for it: the host's functions have no version.
+    let of_library = |name, slot| {
+        if !library.api.contains(&name) {
+            return false;
+        }
+        if in_own_tree(name) {
+            own = true;
+        } else if not_own.is_none() {
+            not_own = Some(name);
+        }
+        match library.functions.iter().find(|(bound, _)| *bound == name) {
+            Some(&(_, function)) => {
+                writable &= image.has_writable_pointer(slot);
+                bindings.push(Binding { slot, function });
+            }
+            None if not_bound.is_none() => not_bound = Some(name),
+            None => {}
+        }
+        true
+    };
+    // Only glibc gets a host library, and glibc binds a `GLOB_DAT` import itself in dlopen().
+    let defers_got = false;
+    // SAFETY: the caller keeps the object of `headers` loaded at `base`.
+    let undefined = unsafe { each_lazy_import(headers, base, defers_got, of_library, is_defined) }?;
+    // One stream must not pass through two implementations of the library: its functions all come from the object's own tree, or all from the host.
+    if let Some(name) = undefined.or(if own { not_own } else { not_bound }) {
+        return Ok(Imports::Unresolved(name));
+    }
+    if own {
+        return Ok(Imports::Resolved(Vec::new()));
+    }
+    if !writable {
+        return Err(Unreadable::Slot);
+    }
+    Ok(Imports::Resolved(bindings))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const PF_W: u32 = 2;
     const DT_REL: u64 = 17;
     const DT_DEBUG: i64 = 21;
     const STB_WEAK: u8 = 2;
@@ -330,6 +441,7 @@ mod tests {
     const SYMBOL: usize = 24;
     const RELOCATION: usize = 24;
     const VERSION_ENTRY: usize = 16;
+    const SLOT: usize = size_of::<usize>();
     const GAP: usize = 11 * SYMBOL;
     /// The last but one is a spare entry, which `add_dynamic` replaces.
     const DYNAMIC_TAGS: [i64; 14] = [
@@ -422,7 +534,7 @@ mod tests {
         AboveItsMapping,
     }
 
-    /// An object in this process's memory: the symbols, strings and relocations of `DT_JMPREL` in one segment, and after gaps the dynamic section in another, and the version tables and the relocations of `DT_RELA` in a third.
+    /// An object in this process's memory: the symbols, strings and relocations of `DT_JMPREL` in one segment, and after gaps the dynamic section in another, the version tables and the relocations of `DT_RELA` in a third, and the slots of the imports in a fourth.
     struct Object {
         memory: Vec<u8>,
         link_address: u64,
@@ -442,6 +554,10 @@ mod tests {
         data_relocations: usize,
         /// Whether the walk is that of musl.
         defers_got: bool,
+        slots: usize,
+        slots_flags: u32,
+        slots_size: usize,
+        read_only_after_relocation: Option<(usize, usize)>,
     }
 
     impl Object {
@@ -477,9 +593,13 @@ mod tests {
             let version_needs = versions + (2 * (1 + imports.len())).next_multiple_of(8);
             let data_relocations = version_needs + version_needs_room;
             let versions_size = data_relocations + imports.len() * RELOCATION - versions;
+            let slots_size = imports.len() * SLOT;
+            let memory = vec![0; versions + versions_size + GAP + SLOT + slots_size + GAP];
+            let slots = versions + versions_size + GAP;
+            let slots = slots + memory.as_ptr().wrapping_add(slots).align_offset(SLOT);
 
             let mut object = Object {
-                memory: vec![0; versions + versions_size + GAP],
+                memory,
                 link_address: 0,
                 tables_flags: PF_R,
                 tables_size,
@@ -493,6 +613,10 @@ mod tests {
                 version_needs,
                 data_relocations,
                 defers_got: false,
+                slots,
+                slots_flags: PF_R | PF_W,
+                slots_size,
+                read_only_after_relocation: None,
             };
             if linked == Linked::AboveItsMapping {
                 object.link_address = (object.memory.as_ptr() as u64).wrapping_add(0x1000_0000);
@@ -512,6 +636,8 @@ mod tests {
                         object.set_data_relocation(index, 1 + index, import.relocation_type)
                     }
                 }
+                object.set_relocation_offset(index, slots + index * SLOT);
+                object.write_u64(slots + index * SLOT, (LAZY + index) as u64);
             }
             let values = [
                 object.pointer(pointers, relocations),
@@ -562,6 +688,11 @@ mod tests {
         fn set_relocation(&mut self, index: usize, symbol: usize, relocation_type: u32) {
             let info = (symbol as u64) << 32 | u64::from(relocation_type);
             self.write_u64(self.relocations + index * RELOCATION + 8, info);
+        }
+
+        fn set_relocation_offset(&mut self, index: usize, offset: usize) {
+            let offset = self.link_address.wrapping_add(offset as u64);
+            self.write_u64(self.relocations + index * RELOCATION, offset);
         }
 
         fn set_data_relocation(&mut self, index: usize, symbol: usize, relocation_type: u32) {
@@ -631,9 +762,13 @@ mod tests {
                 header(PT_LOAD, self.tables_flags, 0, self.tables_size),
                 header(PT_LOAD, PF_R | PF_W, self.dynamic, self.dynamic_load_size),
                 header(PT_LOAD, PF_R, self.versions, self.versions_size),
+                header(PT_LOAD, self.slots_flags, self.slots, self.slots_size),
             ];
             if let Some(size) = self.dynamic_size {
                 headers.push(header(PT_DYNAMIC, PF_R | PF_W, self.dynamic, size));
+            }
+            if let Some((offset, size)) = self.read_only_after_relocation {
+                headers.push(header(PT_GNU_RELRO, PF_R, offset, size));
             }
             headers
         }
@@ -645,11 +780,7 @@ mod tests {
             // SAFETY: the headers describe ranges inside `self.memory`, which outlives the call.
             let found = unsafe {
                 unresolved_lazy_import(&headers, self.base(), self.defers_got, |name, version| {
-                    let mut question = name.to_str().unwrap().to_owned();
-                    if let Some(version) = version {
-                        question = format!("{question}@{}", version.to_str().unwrap());
-                    }
-                    asked.push(question);
+                    asked.push(question(name, version));
                     defined.contains(&asked.last().unwrap().as_str())
                 })
             };
@@ -657,6 +788,100 @@ mod tests {
                 found.map(|name| name.map(|name| name.to_str().unwrap().to_owned())),
                 asked,
             )
+        }
+
+        fn slot(&self, import: usize) -> usize {
+            self.memory.as_ptr() as usize + self.slots + import * SLOT
+        }
+
+        fn slot_values(&self) -> Vec<usize> {
+            let (slots, _) = self.memory[self.slots..].as_chunks::<SLOT>();
+            let imports = (self.tables_size - self.relocations) / RELOCATION;
+            slots[..imports]
+                .iter()
+                .map(|slot| usize::from_le_bytes(*slot))
+                .collect()
+        }
+
+        /// The decision about the imports of `ZLIB` and the others when the object's own tree defines `own` and the process defines `defined`, with what each was asked for: the process as `walk` is.
+        fn resolve(&self, own: &[&str], defined: &[&str]) -> Resolution {
+            let (mut asked_own_tree, mut asked_defined) = (Vec::new(), Vec::new());
+            let headers = self.headers();
+            // SAFETY: the headers describe ranges inside `self.memory`, which outlives the call.
+            let imports = unsafe {
+                resolve_lazy_imports(
+                    &headers,
+                    self.base(),
+                    &ZLIB,
+                    |name| {
+                        let name = name.to_str().unwrap();
+                        asked_own_tree.push(name.to_owned());
+                        own.contains(&name)
+                    },
+                    |name, version| {
+                        asked_defined.push(question(name, version));
+                        defined.contains(&asked_defined.last().unwrap().as_str())
+                    },
+                )
+            };
+            let mut bindings = Vec::new();
+            let decided = imports.map(|imports| match imports {
+                Imports::Resolved(resolved) => {
+                    bindings = resolved;
+                    let import = |binding: &Binding| (binding.slot - self.slot(0)) / SLOT;
+                    Decided::Stores(bindings.iter().map(|b| (import(b), b.function)).collect())
+                }
+                Imports::Unresolved(name) => Decided::Unresolved(name.to_str().unwrap().to_owned()),
+            });
+            Resolution {
+                decided,
+                bindings,
+                asked_own_tree,
+                asked_defined,
+            }
+        }
+    }
+
+    /// `Imports`, with each slot as the number of its import.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Decided {
+        Stores(Vec<(usize, usize)>),
+        Unresolved(String),
+    }
+
+    struct Resolution {
+        decided: Result<Decided, Unreadable>,
+        bindings: Vec<Binding>,
+        asked_own_tree: Vec<String>,
+        asked_defined: Vec<String>,
+    }
+
+    impl Resolution {
+        fn store(&self) {
+            for binding in &self.bindings {
+                // SAFETY: the slots are in the memory of the `Object` that the test still holds.
+                unsafe { binding.store() };
+            }
+        }
+    }
+
+    /// What a slot holds until something is bound: in a real object, the address of its entry in the procedure linkage table.
+    const LAZY: usize = 0x1a2b_3c00;
+    const DEFLATE: usize = 0xdef1_a7e0;
+    const INFLATE: usize = 0x1f1a_7e00;
+    /// The host does not bind `inflateCopy`.
+    const ZLIB: HostLibrary<'static> = HostLibrary {
+        api: &[c"deflate", c"inflate", c"inflateCopy"],
+        functions: &[(c"deflate", DEFLATE), (c"inflate", INFLATE)],
+    };
+    const NONE: [&str; 0] = [];
+
+    /// A question to `is_defined`: the name, or the name and the version as `name@version`.
+    fn question(name: &CStr, version: Option<&CStr>) -> String {
+        let name = name.to_str().unwrap();
+        match version {
+            Some(version) => format!("{name}@{}", version.to_str().unwrap()),
+            None => name.to_owned(),
         }
     }
 
@@ -1325,5 +1550,251 @@ mod tests {
             object.defers_got = true;
             assert_eq!(object.walk(&["first"]), (Err(error), vec![]));
         }
+    }
+
+    const ZLIB_IMPORTS: [Import; 3] = [import("other"), import("deflate"), import("inflate")];
+    const UNBOUND: [usize; 3] = [LAZY, LAZY + 1, LAZY + 2];
+
+    fn stores(bindings: &[(usize, usize)]) -> Result<Decided, Unreadable> {
+        Ok(Decided::Stores(bindings.to_vec()))
+    }
+
+    fn refused(name: &str) -> Result<Decided, Unreadable> {
+        Ok(Decided::Unresolved(name.to_owned()))
+    }
+
+    #[test]
+    fn checks_every_import_of_an_object_that_imports_nothing_of_the_host_library() {
+        let object = Object::new(Linked::AtZero, Pointers::Addresses, &IMPORTS);
+        let resolution = object.resolve(&["second"], &["first"]);
+        assert_eq!(resolution.decided, refused("second"));
+        assert_eq!(resolution.asked_defined, ["first", "second"]);
+        assert_eq!(resolution.asked_own_tree, NONE);
+
+        let resolution = object.resolve(&[], &["first", "second", "third"]);
+        assert_eq!(resolution.decided, stores(&[]));
+        assert_eq!(resolution.asked_own_tree, NONE);
+    }
+
+    #[test]
+    fn binds_nothing_when_the_own_tree_defines_every_import_of_the_library() {
+        let imports = [import("deflate"), import("other"), import("inflateCopy")];
+        let mut object = Object::new(Linked::AtZero, Pointers::Addresses, &imports);
+        let own = ["deflate", "inflateCopy"];
+        let resolution = object.resolve(&own, &["other"]);
+        assert_eq!(resolution.decided, stores(&[]));
+        assert_eq!(resolution.asked_own_tree, own);
+        assert_eq!(resolution.asked_defined, ["other"]);
+
+        // Nothing is stored, so the slots may be read-only.
+        object.slots_flags = PF_R;
+        assert_eq!(object.resolve(&own, &["other"]).decided, stores(&[]));
+    }
+
+    #[test]
+    fn refuses_an_object_whose_own_tree_defines_a_part_of_the_library() {
+        let object = Object::new(Linked::AtZero, Pointers::Addresses, &ZLIB_IMPORTS);
+        for (own, missing) in [("inflate", "deflate"), ("deflate", "inflate")] {
+            let resolution = object.resolve(&[own], &["other"]);
+            assert_eq!(resolution.decided, refused(missing));
+            assert_eq!(resolution.asked_own_tree, ["deflate", "inflate"]);
+        }
+        assert_eq!(object.slot_values(), UNBOUND);
+    }
+
+    #[test]
+    fn binds_the_host_library_when_the_own_tree_defines_none_of_it() {
+        for linked in [Linked::AtZero, Linked::AboveItsMapping] {
+            let object = Object::new(linked, Pointers::Offsets, &ZLIB_IMPORTS);
+            // Another library of the process that defines the names does not change which implementation the object gets.
+            let resolution = object.resolve(&[], &["other", "deflate", "inflate"]);
+            assert_eq!(resolution.decided, stores(&[(1, DEFLATE), (2, INFLATE)]));
+            assert_eq!(resolution.asked_own_tree, ["deflate", "inflate"]);
+            assert_eq!(resolution.asked_defined, ["other"]);
+            assert_eq!(object.slot_values(), UNBOUND);
+
+            resolution.store();
+            assert_eq!(object.slot_values(), [LAZY, DEFLATE, INFLATE]);
+            resolution.store();
+            assert_eq!(object.slot_values(), [LAZY, DEFLATE, INFLATE]);
+        }
+    }
+
+    #[test]
+    fn refuses_an_import_of_the_library_that_the_host_does_not_bind() {
+        let imports = [import("deflate"), import("inflateCopy"), import("inflate")];
+        let object = Object::new(Linked::AtZero, Pointers::Addresses, &imports);
+        // A definition in another library of the process is of another implementation.
+        let resolution = object.resolve(&[], &["deflate", "inflateCopy", "inflate"]);
+        assert_eq!(resolution.decided, refused("inflateCopy"));
+        assert_eq!(
+            resolution.asked_own_tree,
+            ["deflate", "inflateCopy", "inflate"]
+        );
+        assert_eq!(resolution.asked_defined, NONE);
+        assert_eq!(object.slot_values(), UNBOUND);
+
+        let resolution = object.resolve(&["deflate"], &[]);
+        assert_eq!(resolution.decided, refused("inflateCopy"));
+    }
+
+    #[test]
+    fn refuses_an_import_that_nothing_defines_beside_imports_that_the_host_binds() {
+        let imports = [import("deflate"), import("missing"), import("inflate")];
+        let object = Object::new(Linked::AtZero, Pointers::Addresses, &imports);
+        let resolution = object.resolve(&[], &[]);
+        assert_eq!(resolution.decided, refused("missing"));
+        assert_eq!(resolution.asked_own_tree, ["deflate"]);
+        assert_eq!(resolution.asked_defined, ["missing"]);
+        assert_eq!(object.slot_values(), UNBOUND);
+
+        // The walk ends at an import outside the library that nothing defines, so that one is named.
+        let imports = [import("inflateCopy"), import("missing")];
+        let object = Object::new(Linked::AtZero, Pointers::Addresses, &imports);
+        assert_eq!(object.resolve(&[], &[]).decided, refused("missing"));
+    }
+
+    #[test]
+    fn stores_nothing_in_an_object_whose_tables_it_cannot_read_to_the_end() {
+        let mut object = Object::new(Linked::AtZero, Pointers::Addresses, &ZLIB_IMPORTS);
+        object.set_relocation(2, object.tables_size / SYMBOL, R_JUMP_SLOT);
+        let resolution = object.resolve(&[], &["other"]);
+        assert_eq!(resolution.decided, Err(Unreadable::SymbolIndex));
+        assert_eq!(resolution.asked_own_tree, ["deflate"]);
+        assert_eq!(object.slot_values(), UNBOUND);
+    }
+
+    #[test]
+    fn refuses_a_slot_that_is_not_a_writable_pointer() {
+        let object = || Object::new(Linked::AtZero, Pointers::Addresses, &ZLIB_IMPORTS);
+        let slots = object().slots;
+        let cases: [(&str, fn(&mut Object)); 5] = [
+            ("in a segment that is not writable", |object| {
+                object.slots_flags = PF_R
+            }),
+            ("outside the segments", |object| {
+                object.set_relocation_offset(2, object.slots + object.slots_size)
+            }),
+            ("without room for a pointer", |object| {
+                object.slots_size -= SLOT / 2
+            }),
+            ("not aligned", |object| {
+                object.set_relocation_offset(1, object.slots + SLOT + SLOT / 2)
+            }),
+            ("read-only after relocation", |object| {
+                object.read_only_after_relocation = Some((object.slots + SLOT, SLOT))
+            }),
+        ];
+        for (case, change) in cases {
+            let mut object = object();
+            change(&mut object);
+            let resolution = object.resolve(&[], &["other"]);
+            assert_eq!(resolution.decided, Err(Unreadable::Slot), "{case}");
+            assert_eq!(object.slot_values(), UNBOUND, "{case}");
+        }
+
+        // Only the slots that get a function have to be writable.
+        let mut object = object();
+        object.read_only_after_relocation = Some((slots, SLOT));
+        object.set_relocation_offset(0, slots + object.slots_size);
+        let resolution = object.resolve(&[], &["other"]);
+        assert_eq!(resolution.decided, stores(&[(1, DEFLATE), (2, INFLATE)]));
+    }
+
+    #[test]
+    fn does_not_write_to_a_slot_that_holds_the_function() {
+        let protection = libc::PROT_READ | libc::PROT_WRITE;
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+        // SAFETY: maps a new page.
+        let page = unsafe { libc::mmap(core::ptr::null_mut(), SLOT, protection, flags, -1, 0) };
+        assert_ne!(page, libc::MAP_FAILED);
+        let binding = Binding {
+            slot: page.addr(),
+            function: DEFLATE,
+        };
+        // SAFETY: the slot is the start of the page, which is writable.
+        unsafe { binding.store() };
+        // SAFETY: `page` is the mapping above.
+        assert_eq!(unsafe { libc::mprotect(page, SLOT, libc::PROT_READ) }, 0);
+        // SAFETY: the page is readable, and a write to it would end the test with SIGSEGV.
+        unsafe { binding.store() };
+        // SAFETY: the page is readable.
+        assert_eq!(unsafe { page.cast::<usize>().read() }, DEFLATE);
+        // SAFETY: `page` is the mapping above.
+        assert_eq!(unsafe { libc::munmap(page, SLOT) }, 0);
+    }
+
+    #[test]
+    fn binds_nothing_in_an_object_that_is_bound_at_load() {
+        for (tag, value) in BOUND_AT_LOAD {
+            let mut object = Object::new(Linked::AtZero, Pointers::Addresses, &ZLIB_IMPORTS);
+            object.add_dynamic(tag, value);
+            // The loader bound the imports of the library too, so the object has all of them from one implementation.
+            let resolution = object.resolve(&[], &[]);
+            assert_eq!(resolution.decided, stores(&[]), "{tag} {value}");
+            assert_eq!(resolution.asked_own_tree, NONE);
+            assert_eq!(resolution.asked_defined, NONE);
+            resolution.store();
+            assert_eq!(object.slot_values(), UNBOUND);
+        }
+    }
+
+    #[test]
+    fn asks_for_the_version_of_an_import_outside_the_library() {
+        let imports = [versioned("other", 3), import("deflate")];
+        let mut object = Object::new(Linked::AtZero, Pointers::Addresses, &imports);
+        object.set_version_needs(&[&[2, 3]]);
+        let resolution = object.resolve(&[], &["other@VERSION_3"]);
+        assert_eq!(resolution.decided, stores(&[(1, DEFLATE)]));
+        assert_eq!(resolution.asked_defined, ["other", "other@VERSION_3"]);
+
+        let resolution = object.resolve(&[], &["other@VERSION_2"]);
+        assert_eq!(resolution.decided, refused("other"));
+        assert_eq!(resolution.asked_defined, ["other", "other@VERSION_3"]);
+
+        let resolution = object.resolve(&[], &["other", "other@VERSION_3"]);
+        assert_eq!(resolution.decided, stores(&[(1, DEFLATE)]));
+        assert_eq!(resolution.asked_defined, ["other"]);
+    }
+
+    #[test]
+    fn decides_an_import_of_the_library_by_its_name_whatever_version_it_names() {
+        let imports = [
+            versioned("deflate", 3),
+            versioned("inflate", 3),
+            import("other"),
+        ];
+        let mut object = Object::new(Linked::AtZero, Pointers::Addresses, &imports);
+        object.set_version_needs(&[&[2, 3]]);
+        // The own tree has none by the name: the host's are bound, whatever the process defines by the name or by the version.
+        let defined = ["other", "deflate", "deflate@VERSION_3", "inflate"];
+        let resolution = object.resolve(&[], &defined);
+        assert_eq!(resolution.decided, stores(&[(0, DEFLATE), (1, INFLATE)]));
+        assert_eq!(resolution.asked_own_tree, ["deflate", "inflate"]);
+        assert_eq!(resolution.asked_defined, ["other"]);
+
+        // The own tree has them by the name: nothing is bound, and nothing asks for the version.
+        let resolution = object.resolve(&["deflate", "inflate"], &["other"]);
+        assert_eq!(resolution.decided, stores(&[]));
+        assert_eq!(resolution.asked_own_tree, ["deflate", "inflate"]);
+        assert_eq!(resolution.asked_defined, ["other"]);
+
+        let resolution = object.resolve(&["deflate"], &["other", "inflate@VERSION_3"]);
+        assert_eq!(resolution.decided, refused("inflate"));
+    }
+
+    #[test]
+    fn leaves_the_imports_through_the_global_offset_table_to_the_loader() {
+        // glibc binds these in dlopen(), which fails if nothing defines one: the decision never reads the table of `DT_RELA`.
+        let imports = [
+            got_import("deflate"),
+            got_import("missing"),
+            import("inflate"),
+        ];
+        let object = Object::new(Linked::AtZero, Pointers::Addresses, &imports);
+        let resolution = object.resolve(&[], &[]);
+        assert_eq!(resolution.decided, stores(&[(2, INFLATE)]));
+        assert_eq!(resolution.asked_own_tree, ["inflate"]);
+        assert_eq!(resolution.asked_defined, NONE);
     }
 }

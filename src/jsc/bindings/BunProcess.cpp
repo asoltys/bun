@@ -465,7 +465,7 @@ extern "C" void* CrashHandler__beginDlOpenAction(const char* path);
 extern "C" void CrashHandler__endDlOpenAction(void* guard);
 extern "C" bool Bun__VM__allowAddons(void* vm);
 extern "C" int32_t Bun__addonNeedsGlibcOnMusl(const char* path, size_t len, char* soname_out, size_t soname_cap);
-extern "C" int32_t Bun__addonUnresolvedImport(const void* initializer, void* handle, char* name_out, size_t name_cap);
+extern "C" int32_t Bun__addonResolveImports(const void* initializer, void* handle, char* name_out, size_t name_cap);
 
 // Drops only this load's reference. A library that registered modules on an earlier load is still referenced by that load.
 static void closeDLHandle(Bun::DLHandleMap::DLHandle handle)
@@ -767,7 +767,7 @@ JSC_DEFINE_HOST_FUNCTION_WITH_ATTRIBUTES(Process_functionDlopen, __attribute__((
 #if !OS(ANDROID)
             // The addon is opened with RTLD_LAZY, so a call of an import that nothing defines would end the process. bionic binds every import in dlopen().
             char symbol[512] = { 0 };
-            if (int32_t result = Bun__addonUnresolvedImport(reinterpret_cast<void*>(initializer), handle, symbol, sizeof(symbol))) {
+            if (int32_t result = Bun__addonResolveImports(reinterpret_cast<void*>(initializer), handle, symbol, sizeof(symbol))) {
                 closeDLHandle(handle);
                 if (result < 0)
                     return throwError(globalObject, scope, ErrorCode::ERR_DLOPEN_FAILED, makeString("Cannot load native addon "_s, filename, ": Bun cannot read its import tables"_s));

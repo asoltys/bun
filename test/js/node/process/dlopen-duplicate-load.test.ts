@@ -1,7 +1,19 @@
 import { spawnSync } from "bun";
+import { dlopen, ptr } from "bun:ffi";
 import { beforeAll, describe, expect, test } from "bun:test";
 import { copyFileSync, readFileSync, writeFileSync } from "fs";
-import { bunEnv, bunExe, canBuildNodeAddons, isLinux, isMacOS, isMusl, isWindows, tempDirWithFiles } from "harness";
+import {
+  bunEnv,
+  bunExe,
+  canBuildNodeAddons,
+  isGlibc,
+  isLinux,
+  isMacOS,
+  isMusl,
+  isWindows,
+  tempDirWithFiles,
+} from "harness";
+import { deflateRawSync } from "node:zlib";
 import { join } from "path";
 
 // These tests share one node-gyp build of their addons (the compile
@@ -19,6 +31,36 @@ import { join } from "path";
 //   once the static constructors after the module registration have run
 // - the entry of an addon: a registration, the symbol napi_register_module_v1, or
 //   the symbol node_register_module_v<ABI> where Bun can check the addon's imports
+// - zlib: with glibc, an addon with that last entry that imports zlib from the host
+//   as it does from Node, and has no zlib of its own, gets Bun's zlib
+
+// The zlib that the system has beside Bun's: the file that the loader finds for libz.so.1, which some addons of these
+// tests link, and its raw deflate of a text. Undefined where there is none, and off glibc.
+const systemZlib = isGlibc ? openSystemZlib() : undefined;
+
+function openSystemZlib() {
+  try {
+    const { symbols } = dlopen("libz.so.1", {
+      compress2: { args: ["ptr", "ptr", "ptr", "u64", "i32"], returns: "i32" },
+      compressBound: { args: ["u64"], returns: "u64" },
+    });
+    const path = readFileSync("/proc/self/maps", "utf8").match(/ (\/.*\/libz\.so\.1[^/\n]*)$/m)?.[1];
+    if (!path) return undefined;
+    return {
+      path,
+      deflateRaw(text: string, level: number) {
+        const input = Buffer.from(text);
+        const output = Buffer.alloc(Number(symbols.compressBound(input.length)));
+        const length = new BigUint64Array([BigInt(output.length)]);
+        expect(symbols.compress2(ptr(output), ptr(length), ptr(input), input.length, level)).toBe(0);
+        // compress2() writes the 2 bytes of the zlib header before the raw deflate and the 4 of the checksum after it.
+        return output.subarray(2, Number(length[0]) - 4).toString("hex");
+      },
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 describe.skipIf(!canBuildNodeAddons())("process.dlopen native addon", () => {
   let addonPath: string;
@@ -150,6 +192,21 @@ void Initialize(Local<Object> exports, Local<Value> module, void* priv) {
 NODE_MODULE(non_context_aware, demo::Initialize)
 `;
 
+    // These link the system's zlib by the path of its file: the system may have no libz.so for -lz.
+    const systemZlibTargets = !systemZlib
+      ? ""
+      : `
+        {
+          "target_name": "initializer_system_zlib_import",
+          "sources": [ "initializer_zlib_import.cpp" ],
+          "libraries": [ ${JSON.stringify(systemZlib.path)} ]
+        },
+        {
+          "target_name": "zlib_sqlite_extension",
+          "sources": [ "zlib_sqlite_extension.c" ],
+          "libraries": [ ${JSON.stringify(systemZlib.path)} ]
+        },`;
+
     const bindingGyp = `
 {
   "targets": [
@@ -187,8 +244,7 @@ NODE_MODULE(non_context_aware, demo::Initialize)
         },
         {
           "target_name": "initializer_zlib_import",
-          "sources": [ "initializer_missing_import.cpp" ],
-          "defines": [ "MISSING_FUNCTION=deflateInit_" ],
+          "sources": [ "initializer_zlib_import.cpp" ],
           "ldflags": [ "-Wl,-z,lazy" ]
         },
         {
@@ -213,6 +269,28 @@ NODE_MODULE(non_context_aware, demo::Initialize)
           "sources": [ "initializer_compat_import.cpp" ],
           "ldflags": [ "-Wl,-z,lazy" ]
         },
+        {
+          "target_name": "initializer_zlib_unbound_import",
+          "sources": [ "initializer_zlib_import.cpp" ],
+          "defines": [ "UNBOUND_ZLIB_FUNCTION=inflateCopy" ],
+          "ldflags": [ "-Wl,-z,lazy" ]
+        },
+        {
+          "target_name": "partial_zlib",
+          "type": "shared_library",
+          "sources": [ "partial_zlib.c" ]
+        },
+        {
+          "target_name": "initializer_partial_zlib_import",
+          "sources": [ "initializer_zlib_import.cpp" ],
+          "dependencies": [ "partial_zlib" ],
+          "ldflags": [ "-Wl,-z,lazy" ]
+        },
+        {
+          "target_name": "initializer_read_only_zlib_import",
+          "sources": [ "initializer_zlib_import.cpp" ],
+          "ldflags": [ "-Wl,-z,now", "-Wl,-z,relro" ]
+        },${systemZlibTargets}
         {
           "target_name": "initializer_weak_import",
           "sources": [ "initializer_weak_import.cpp" ]
@@ -716,10 +794,10 @@ if (!isMainThread) {
     const callsTheSymbol = !isMacOS && !isWindows;
     const built = (addon: string) => join(addonPath, "..", addon);
 
-    async function run(args: string[], addon: string) {
+    async function run(args: string[], addon: string, env: Record<string, string> = {}) {
       await using proc = Bun.spawn({
         cmd: [bunExe(), ...args],
-        env: { ...bunEnv, ADDON_PATH: built(addon) },
+        env: { ...bunEnv, ADDON_PATH: built(addon), ...env },
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -760,7 +838,8 @@ if (!isMainThread) {
       view.setBigUint64(stringTableSizes[0].offset + 8, 0n, true);
       writeFileSync(built(copy), image);
     };
-    // The error of a dlopen() that failed: the loader's own text, which names the symbol that it did not find.
+    // The error of a dlopen() that failed: the loader's own text, which names the symbol that it did not find. The
+    // symbol is a part of a regular expression.
     const refusedByLoader = (symbol: string) => ({
       ...refused(""),
       stdout: expect.stringMatching(
@@ -817,10 +896,9 @@ if (!isMainThread) {
     // and musl a GLOB_DAT too: those Bun finds before it calls the initializer.
     test.skipIf(!isLinux).each([
       ["initializer_missing_import.node", "bun_test_symbol_that_nothing_defines"],
-      // Node's executable exports zlib, and Bun's does not.
-      ["initializer_zlib_import.node", "deflateInit_"],
       // Compiled with -fno-plt: the call goes through the global offset table.
       ["initializer_got_import.node", "bun_test_symbol_that_nothing_defines"],
+      // An addon that imports zlib, which Node's executable exports, has its tests at the end.
     ])("%s is refused, because nothing defines its import %s", async (addon, symbol) => {
       const { bindNow, relocations } = elfImports(built(addon));
       const relocation = relocations.get(symbol);
@@ -902,6 +980,147 @@ if (!isMainThread) {
     test("an addon without an entry did not self-register", async () => {
       expect(await load("no_registration.node")).toEqual(
         refused(`Module did not self-register: '${built("no_registration.node")}'.`),
+      );
+    });
+
+    // Node's executable exports its zlib to addons, and uWebSockets.js imports 13 functions of it. Bun does not export
+    // its zlib. With glibc it stores the addresses of these 13 in the addon's import slots before the initializer runs.
+    describe("an addon with only this entry that imports zlib", () => {
+      const text = Array.from(
+        { length: 120 },
+        (_, i) => `${(i * 7919) % 1000} bottles of ${["beer", "milk", "tea"][i % 3]} on the wall`,
+      ).join("\n");
+      // The raw deflate at levels 1 and 6, which differs from one implementation of zlib to another.
+      const deflatedByBun = [1, 6].map(level => deflateRawSync(text, { level }).toString("hex"));
+      // The addon's roundTrip() returns the same two after it has used all 13 functions and inflated what it deflated.
+      const roundTrip = `
+        const roundTrip = addon => {
+          const loaded = { exports: {} };
+          process.dlopen(loaded, addon);
+          return loaded.exports.roundTrip(${JSON.stringify(text)});
+        };
+      `;
+      const printed = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: "", exitCode: 0 });
+      // The same two from the system's zlib, where the system has one.
+      const deflatedBySystem = () => [1, 6].map(level => systemZlib!.deflateRaw(text, level));
+      // db.loadExtension() opens the extension and the zlib that it needs with RTLD_GLOBAL: every later lookup in the
+      // global scope of the process finds the system's zlib.
+      const withSystemZlibInGlobalScope = (script: string) =>
+        run(
+          [
+            "-e",
+            `
+              const database = new (require("bun:sqlite").Database)(":memory:");
+              database.loadExtension(process.env.EXTENSION);
+              ${script}
+              database.close();
+            `,
+          ],
+          "initializer_zlib_import.node",
+          {
+            EXTENSION: built("zlib_sqlite_extension.node"),
+            READ_ONLY: built("initializer_read_only_zlib_import.node"),
+          },
+        );
+
+      test.skipIf(!isGlibc)("gets Bun's zlib when it links none", async () => {
+        const script = `${roundTrip} console.log(JSON.stringify(roundTrip(process.env.ADDON_PATH)));`;
+        expect(await run(["-e", script], "initializer_zlib_import.node")).toEqual(printed(deflatedByBun));
+      });
+
+      // With musl nothing is bound, because musl binds a pending import again at a later dlopen(). Bun refuses the
+      // addon on the first of its zlib imports, unless the addon is linked with BIND_NOW and dlopen() has failed.
+      test.skipIf(!isMusl)("is refused with musl, because nothing defines its imports", async () => {
+        const addon = "initializer_zlib_import.node";
+        const { bindNow, relocations } = elfImports(built(addon));
+        const first = [...relocations.keys()].find(symbol => /^(?:de|in)flate/.test(symbol));
+        expect(await load(addon)).toEqual(
+          bindNow
+            ? refusedByLoader("(?:de|in)flate\\w*")
+            : refused(`Cannot load native addon ${built(addon)}: it imports '${first}', which Bun does not provide`),
+        );
+      });
+
+      // Three of the next four are skipped where the system has no zlib of its own (libz.so.1) for an addon to link.
+      // The zlib that an addon gets must not depend on what the process loaded before it.
+      test.skipIf(!systemZlib)(
+        "gets Bun's zlib when it links none and the system's zlib is in the global scope",
+        async () => {
+          const script = `${roundTrip} console.log(JSON.stringify(roundTrip(process.env.ADDON_PATH)));`;
+          expect(await withSystemZlibInGlobalScope(script)).toEqual(printed(deflatedByBun));
+        },
+      );
+
+      // Linked with -z now and -z relro, the addon opens only when the global scope has a zlib. dlopen() binds every
+      // import to that one and then makes the slots read-only: Bun has no import left to bind, and stores nothing.
+      test.skipIf(!systemZlib)("keeps the zlib that the loader bound when it is linked with -z now", async () => {
+        expect(elfImports(built("initializer_read_only_zlib_import.node")).bindNow).toBe(true);
+        const script = `${roundTrip} console.log(JSON.stringify(roundTrip(process.env.READ_ONLY)));`;
+        expect(await withSystemZlibInGlobalScope(script)).toEqual(printed(deflatedBySystem()));
+      });
+
+      test.skipIf(!isLinux)(
+        "fails in dlopen() when it is linked with -z now and no zlib is in the global scope",
+        async () => {
+          expect(await load("initializer_read_only_zlib_import.node")).toEqual(refusedByLoader("(?:de|in)flate\\w*"));
+        },
+      );
+
+      test.skipIf(!systemZlib)("keeps the zlib that it links, and Bun binds nothing", async () => {
+        const script = `${roundTrip} console.log(JSON.stringify(roundTrip(process.env.ADDON_PATH)));`;
+        expect(await run(["-e", script], "initializer_system_zlib_import.node")).toEqual(printed(deflatedBySystem()));
+      });
+
+      // One stream must not pass through two implementations of zlib.
+      test.skipIf(!isGlibc)("is refused when the library that it links has only a part of zlib", async () => {
+        const addon = "initializer_partial_zlib_import.node";
+        expect(await load(addon)).toEqual(
+          refused(
+            `Cannot load native addon ${built(addon)}: it imports 'inflateSetDictionary', which Bun does not provide`,
+          ),
+        );
+      });
+
+      test.skipIf(!isGlibc)(
+        "is refused when it imports a function of zlib that Bun does not bind, and a later addon loads",
+        async () => {
+          const script = `
+            ${roundTrip}
+            const report = {};
+            try {
+              roundTrip(process.env.UNBOUND);
+            } catch (e) {
+              report.refused = { code: e.code, message: e.message };
+            }
+            report.later = roundTrip(process.env.ADDON_PATH);
+            console.log(JSON.stringify(report));
+          `;
+          const unbound = built("initializer_zlib_unbound_import.node");
+          expect(await run(["-e", script], "initializer_zlib_import.node", { UNBOUND: unbound })).toEqual(
+            printed({
+              refused: {
+                code: "ERR_DLOPEN_FAILED",
+                message: `Cannot load native addon ${unbound}: it imports 'inflateCopy', which Bun does not provide`,
+              },
+              later: deflatedByBun,
+            }),
+          );
+        },
+      );
+
+      // The first loads of one library store the same addresses in the same slots at the same time. A pass shows that
+      // no result was wrong, not that there is no race. It runs alone: its 8 threads slow the tests beside it, and a
+      // debug build writes the crash reports above close to their timeout.
+      test.serial.skipIf(!isGlibc)(
+        "gets Bun's zlib in 8 Workers that load it at the same time",
+        async () => {
+          const fixture = join(workerFixturePath, "..", "zlib-workers-fixture.js");
+          expect(await run([fixture], "initializer_zlib_import.node", { TEXT: text })).toEqual(
+            printed({ workers: 8, roundTrips: 8 * 200, results: [deflatedByBun] }),
+          );
+          // The longer timeout is for debug builds, where 8 Workers take seconds to start and ASAN maps each zlib stream.
+        },
+        30_000,
       );
     });
   });
@@ -1010,6 +1229,147 @@ ${initializer} {
   init_count++;
   NODE_SET_METHOD(exports, "hello", Hello);
   NODE_SET_METHOD(exports, "initCount", InitCount);
+}
+`,
+
+    // As uWebSockets.js, this takes zlib from the host: the targets that link a zlib say so in binding.gyp.
+    "initializer_zlib_import.cpp": `
+#include <node.h>
+#include <zlib.h>
+
+#include <string>
+
+static const Bytef dictionary[] = "a preset dictionary";
+
+#ifdef UNBOUND_ZLIB_FUNCTION
+// Bun does not bind this function of zlib. It is in the PLT and is never called.
+extern "C" NODE_MODULE_EXPORT void never_called() { UNBOUND_ZLIB_FUNCTION(nullptr, nullptr); }
+#endif
+
+// Deflates the input, inflates the result, and says whether that gave the input back.
+static bool DeflateAndInflate(z_stream& deflater, z_stream& inflater, std::string& input, std::string& deflated) {
+  deflated.assign(deflateBound(&deflater, input.size()), '\\0');
+  deflater.next_in = reinterpret_cast<Bytef*>(input.data());
+  deflater.avail_in = input.size();
+  deflater.next_out = reinterpret_cast<Bytef*>(deflated.data());
+  deflater.avail_out = deflated.size();
+  if (deflate(&deflater, Z_FINISH) != Z_STREAM_END) return false;
+  deflated.resize(deflated.size() - deflater.avail_out);
+
+  std::string inflated(input.size(), '\\0');
+  inflater.next_in = reinterpret_cast<Bytef*>(deflated.data());
+  inflater.avail_in = deflated.size();
+  inflater.next_out = reinterpret_cast<Bytef*>(inflated.data());
+  inflater.avail_out = inflated.size();
+  return inflate(&inflater, Z_FINISH) == Z_STREAM_END && inflated == input;
+}
+
+// Calls the 13 functions of zlib that uWebSockets.js imports: a raw stream, that stream again after a reset and with a
+// dictionary, and a stream in the zlib format. \`raw\` is the deflate of the first.
+static bool RoundTrip(std::string& input, int level, std::string& raw) {
+  z_stream deflater = {};
+  z_stream inflater = {};
+  std::string other;
+  bool ok = deflateInit2(&deflater, level, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) == Z_OK &&
+            inflateInit2(&inflater, -MAX_WBITS) == Z_OK &&
+            DeflateAndInflate(deflater, inflater, input, raw) &&
+            deflateReset(&deflater) == Z_OK &&
+            inflateReset(&inflater) == Z_OK &&
+            deflateSetDictionary(&deflater, dictionary, sizeof dictionary) == Z_OK &&
+            inflateSetDictionary(&inflater, dictionary, sizeof dictionary) == Z_OK &&
+            DeflateAndInflate(deflater, inflater, input, other) &&
+            deflateEnd(&deflater) == Z_OK &&
+            inflateEnd(&inflater) == Z_OK;
+  deflater = {};
+  inflater = {};
+  return ok &&
+         deflateInit(&deflater, level) == Z_OK &&
+         inflateInit(&inflater) == Z_OK &&
+         DeflateAndInflate(deflater, inflater, input, other) &&
+         deflateEnd(&deflater) == Z_OK &&
+         inflateEnd(&inflater) == Z_OK;
+}
+
+// roundTrip(text) returns the raw deflate of the text at levels 1 and 6, in hexadecimal.
+static void RoundTripCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::Local<v8::String> text = args[0].As<v8::String>();
+  std::string input(text->Utf8LengthV2(isolate), '\\0');
+  text->WriteUtf8V2(isolate, input.data(), input.size());
+
+  v8::Local<v8::Value> deflated[2];
+  for (int i = 0; i < 2; i++) {
+    std::string raw, hex;
+    if (!RoundTrip(input, i == 0 ? 1 : 6, raw)) {
+      isolate->ThrowException(v8::Exception::Error(v8::String::NewFromUtf8(isolate, "zlib failed").ToLocalChecked()));
+      return;
+    }
+    for (unsigned char byte : raw) {
+      hex += "0123456789abcdef"[byte >> 4];
+      hex += "0123456789abcdef"[byte & 15];
+    }
+    deflated[i] = v8::String::NewFromUtf8(isolate, hex.data(), v8::NewStringType::kNormal, hex.size()).ToLocalChecked();
+  }
+  args.GetReturnValue().Set(v8::Array::New(isolate, deflated, 2));
+}
+
+${initializer} {
+  NODE_SET_METHOD(exports, "roundTrip", RoundTripCallback);
+}
+`,
+
+    // A zlib that lacks inflateSetDictionary: the other 12 of the 13 functions that the addon imports.
+    "partial_zlib.c": `
+#define DEFINE(name) int name(void) { return -1; }
+DEFINE(deflate) DEFINE(deflateBound) DEFINE(deflateEnd) DEFINE(deflateInit2_) DEFINE(deflateInit_) DEFINE(deflateReset)
+DEFINE(deflateSetDictionary) DEFINE(inflate) DEFINE(inflateEnd) DEFINE(inflateInit2_) DEFINE(inflateInit_) DEFINE(inflateReset)
+`,
+
+    // A SQLite extension that needs the system's zlib, as compress, sqlar and zipfile do.
+    "zlib_sqlite_extension.c": `
+extern const char* zlibVersion(void);
+int sqlite3_extension_init(void* database, char** error, const void* api) { return zlibVersion() ? 0 : 1; }
+`,
+
+    // Eight Workers wait at a gate. Then each loads the addon at $ADDON_PATH, which nothing has loaded before, and runs
+    // the round trip 200 times.
+    "zlib-workers-fixture.js": `
+const { Worker, isMainThread, parentPort, workerData } = require("node:worker_threads");
+
+if (isMainThread) {
+  const gate = new Int32Array(new SharedArrayBuffer(4));
+  const report = { workers: 0, roundTrips: 0, results: [] };
+  let waiting = 0;
+  for (let i = 0; i < 8; i++) {
+    const worker = new Worker(__filename, { workerData: gate });
+    worker.on("message", message => {
+      if (message === "waiting") {
+        if (++waiting === 8) {
+          Atomics.store(gate, 0, 1);
+          Atomics.notify(gate, 0);
+        }
+        return;
+      }
+      report.roundTrips += message.roundTrips;
+      for (const result of message.results) {
+        if (!report.results.includes(result)) report.results.push(result);
+      }
+      if (++report.workers < 8) return;
+      console.log(JSON.stringify({ ...report, results: report.results.map(result => JSON.parse(result)) }));
+    });
+    worker.on("error", error => {
+      console.log(JSON.stringify({ error: error.message }));
+      process.exit(1);
+    });
+  }
+} else {
+  parentPort.postMessage("waiting");
+  Atomics.wait(workerData, 0, 0);
+  const loaded = { exports: {} };
+  process.dlopen(loaded, process.env.ADDON_PATH);
+  const results = new Set();
+  for (let i = 0; i < 200; i++) results.add(JSON.stringify(loaded.exports.roundTrip(process.env.TEXT)));
+  parentPort.postMessage({ roundTrips: 200, results: [...results] });
 }
 `,
 
