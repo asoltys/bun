@@ -50,7 +50,7 @@ inline bool collectOwnEnumerableProperties(JSC::VM& vm, JSC::JSObject* object, O
 }
 
 // std::nullopt: the caller compares by its generic path, or an exception is pending.
-template<bool isStrict, typename CompareValues>
+template<bool isStrict, bool nodeKeyOrder, typename CompareValues>
 std::optional<bool> compareCompiledObjectProperties(JSC::JSGlobalObject* globalObject, JSC::ThrowScope& scope, JSC::JSObject* o1, JSC::JSObject* o2, const CompareValues& compareValues)
 {
     JSC::VM& vm = globalObject->vm();
@@ -58,6 +58,11 @@ std::optional<bool> compareCompiledObjectProperties(JSC::JSGlobalObject* globalO
     OwnEnumerableProperties properties2;
     if (!collectOwnEnumerableProperties(vm, o1, properties1) || !collectOwnEnumerableProperties(vm, o2, properties2))
         return std::nullopt;
+    if constexpr (nodeKeyOrder) {
+        // node walks the keys of the second object: only for the same keys in the same order is that this walk.
+        if (properties1.names != properties2.names)
+            return std::nullopt;
+    }
 
     JSC::MarkedArgumentBuffer pairs;
     for (size_t i = 0; i < properties1.names.size(); i++) {

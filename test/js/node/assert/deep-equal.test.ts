@@ -6,6 +6,7 @@ import assert from "node:assert";
 import { createPrivateKey, createPublicKey, createSecretKey, generateKeyPairSync } from "node:crypto";
 import { describe, test } from "node:test";
 import util from "node:util";
+import vm from "node:vm";
 
 // Node repeats its first throwing comparison, with cycle detection on, which would disturb tests that count reads.
 try {
@@ -117,6 +118,153 @@ function selfReferencingArray() {
   const array: unknown[] = [];
   array.push(array);
   return array;
+}
+
+/** A Proxy of `target` whose get trap answers `value` for `key`. */
+function lyingProxy<T extends object>(target: T, key: PropertyKey, value: unknown): T {
+  return new Proxy(target, { get: (t, k, receiver) => (k === key ? value : Reflect.get(t, k, receiver)) });
+}
+
+/** A Proxy of `target` whose getOwnPropertyDescriptor trap answers `value` for `key`. */
+function proxyWithDescriptor<T extends object>(target: T, key: PropertyKey, value: unknown): T {
+  return new Proxy(target, {
+    getOwnPropertyDescriptor: (t, k) =>
+      k === key
+        ? { value, writable: true, enumerable: true, configurable: true }
+        : Reflect.getOwnPropertyDescriptor(t, k),
+  });
+}
+
+/** Gives `target` a getter `x` that deletes `y`, then `y: 2`. */
+function withGetterThatDeletes<T extends object>(target: T): T {
+  Object.defineProperty(target, "x", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      delete this.y;
+      return 1;
+    },
+  });
+  return Object.assign(target, { y: 2 });
+}
+
+/** A Proxy of `target` whose ownKeys trap lists the keys in the opposite order. */
+function proxyWithKeysReversed<T extends object>(target: T, handler: ProxyHandler<T> = {}): T {
+  return new Proxy(target, { ...handler, ownKeys: t => Reflect.ownKeys(t).reverse() });
+}
+
+/** A Proxy that also wraps every object it hands out, with one wrapper for each object. */
+function deepProxy<T extends object>(target: T, wrappers = new WeakMap<object, object>()): T {
+  let proxy = wrappers.get(target);
+  if (!proxy) {
+    proxy = new Proxy(target, {
+      get(t, key, receiver) {
+        const value = Reflect.get(t, key, receiver);
+        return typeof value === "object" && value !== null ? deepProxy(value, wrappers) : value;
+      },
+    });
+    wrappers.set(target, proxy);
+  }
+  return proxy as T;
+}
+
+const ref = (value: unknown) => ({ isRef: true, value });
+
+/** A Proxy that answers with the `value` of a property that holds a ref, as a Vue reactive object does. */
+function unwrappingProxy<T extends object>(target: T): T {
+  return new Proxy(target, {
+    get(t, key, receiver) {
+      const value: unknown = Reflect.get(t, key, receiver);
+      const held = value as { isRef?: unknown; value?: unknown } | null;
+      return typeof held === "object" && held !== null && held.isRef === true ? held.value : value;
+    },
+  });
+}
+
+/** `{ self: itself, ...rest }` with `self` added first or last. */
+function selfReferencingWith(rest: Record<string, unknown>, selfFirst: boolean) {
+  const object: Record<string, unknown> = {};
+  if (selfFirst) object.self = object;
+  Object.assign(object, rest);
+  if (!selfFirst) object.self = object;
+  return object;
+}
+
+const sparseArray = (named: Record<string, unknown>) => Object.assign([1, , 3], named);
+
+/** Makes `array[index]` an enumerable getter that answers `value`. */
+function withAccessorElement<T>(array: T[], index: number, value: T): T[] {
+  return Object.defineProperty(array, index, { enumerable: true, configurable: true, get: () => value });
+}
+
+/** Gives `array` an enumerable getter `x` that runs `effect` on the array, then answers 1. */
+function withGetterX<T>(array: T[], effect: (array: T[]) => void = () => {}): T[] {
+  return Object.defineProperty(array, "x", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      effect(this);
+      return 1;
+    },
+  });
+}
+
+/** A Proxy of [] whose get trap answers `length()` for length and `at(index)` for every index. */
+function virtualArray(length: () => number, at: (index: number) => unknown): unknown[] {
+  return new Proxy([], {
+    get(target, key, receiver) {
+      if (key === "length") return length();
+      if (typeof key === "string" && /^(0|[1-9]\d*)$/.test(key)) return at(Number(key));
+      return Reflect.get(target, key, receiver);
+    },
+  });
+}
+
+class WithPrivate {
+  #p: unknown;
+  x = 1;
+  constructor(p: unknown) {
+    this.#p = p;
+  }
+  get p() {
+    return this.#p;
+  }
+}
+
+class PrivateThenSymbol {
+  #p: unknown;
+  [sym] = 1;
+  x = 1;
+  constructor(p: unknown) {
+    this.#p = p;
+  }
+  get p() {
+    return this.#p;
+  }
+}
+
+class SymbolThenPrivate {
+  [sym] = 1;
+  #p: unknown;
+  x = 1;
+  constructor(p: unknown) {
+    this.#p = p;
+  }
+  get p() {
+    return this.#p;
+  }
+}
+
+/** `{ a: child, b }` where reading `child.b` deletes `b` from the parent. */
+function withChildThatDeletesB(b: unknown) {
+  const parent: Record<string, unknown> = { a: null, b };
+  parent.a = {
+    get b() {
+      delete parent.b;
+      return 1;
+    },
+  };
+  return parent;
 }
 
 function argumentsObject(...values: unknown[]) {
@@ -1116,6 +1264,893 @@ const cases: Case[] = [
   },
 ];
 
+interface OrderedPair {
+  first: string;
+  second: string;
+  a: Thunk;
+  b: Thunk;
+  /** Expectations for (first, second), then for (second, first). */
+  strict: [boolean, boolean];
+  loose: [boolean, boolean];
+  strictBug?: [string | undefined, string | undefined];
+  looseBug?: [string | undefined, string | undefined];
+}
+
+// Node reads the second operand's values with [[Get]]. It reads the first operand's with [[Get]] too while both
+// list their keys in the same order, and from its own property descriptor after the first difference (objEquiv in
+// lib/internal/util/comparisons.js). So an answer can depend on the argument order: each pair is a case in both.
+const orderedPairs: OrderedPair[] = [
+  {
+    first: "{ a: 1 }",
+    second: "a Proxy of { a: 1 } whose get trap answers 2 for a",
+    a: () => ({ a: 1 }),
+    b: () => lyingProxy({ a: 1 }, "a", 2),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "{ a: 2 }",
+    second: "a Proxy of { a: 1 } whose get trap answers 2 for a",
+    a: () => ({ a: 2 }),
+    b: () => lyingProxy({ a: 1 }, "a", 2),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "{ a: [1], b: 2 }",
+    second: "a Proxy of { a: [1], b: 2 } whose get trap answers 999 for a",
+    a: () => ({ a: [1], b: 2 }),
+    b: () => lyingProxy({ a: [1], b: 2 }, "a", 999),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "a Proxy of { a: 1 } whose get trap answers 2 for a",
+    second: "another such Proxy",
+    a: () => lyingProxy({ a: 1 }, "a", 2),
+    b: () => lyingProxy({ a: 1 }, "a", 2),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "a Proxy of { a: 1 } whose get trap answers 2 for a",
+    second: "a Proxy of { a: 2 }",
+    a: () => lyingProxy({ a: 1 }, "a", 2),
+    b: () => new Proxy({ a: 2 }, {}),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "{ [sym]: 1 }",
+    second: "a Proxy of { [sym]: 1 } whose get trap answers 2 for sym",
+    a: () => ({ [sym]: 1 }),
+    b: () => lyingProxy({ [sym]: 1 }, sym, 2),
+    strict: [false, false],
+    loose: [true, true],
+    looseBug: ["reports not equal", "reports not equal"],
+  },
+  {
+    first: "{ [sym]: 2 }",
+    second: "a Proxy of { [sym]: 1 } whose get trap answers 2 for sym",
+    a: () => ({ [sym]: 2 }),
+    b: () => lyingProxy({ [sym]: 1 }, sym, 2),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "a class instance",
+    second: "a Proxy of an equal instance whose get trap answers 2 for a",
+    a: () => new WithValue(),
+    b: () => lyingProxy(new WithValue(), "a", 2),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "{ x: { a: 2 } }",
+    second: "{ x: a Proxy of { a: 1 } whose get trap answers 2 for a }",
+    a: () => ({ x: { a: 2 } }),
+    b: () => ({ x: lyingProxy({ a: 1 }, "a", 2) }),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "[{ a: 2 }]",
+    second: "[a Proxy of { a: 1 } whose get trap answers 2 for a]",
+    a: () => [{ a: 2 }],
+    b: () => [lyingProxy({ a: 1 }, "a", 2)],
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "a Map holding { a: 2 }",
+    second: "a Map holding a Proxy of { a: 1 } whose get trap answers 2 for a",
+    a: () => new Map([["k", { a: 2 }]]),
+    b: () => new Map([["k", lyingProxy({ a: 1 }, "a", 2)]]),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "a Set holding { a: 2 }",
+    second: "a Set holding a Proxy of { a: 1 } whose get trap answers 2 for a",
+    a: () => new Set([{ a: 2 }]),
+    b: () => new Set([lyingProxy({ a: 1 }, "a", 2)]),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "an Error with info: { a: 2 }",
+    second: "an Error with info: a Proxy of { a: 1 } whose get trap answers 2 for a",
+    a: () => Object.assign(new Error("m"), { info: { a: 2 } }),
+    b: () => Object.assign(new Error("m"), { info: lyingProxy({ a: 1 }, "a", 2) }),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  // Different key orders: the first operand's value comes from its descriptor, which a get trap does not change.
+  {
+    first: "{ b: 2, a: 1 }",
+    second: "a Proxy of { a: 1, b: 2 } whose get trap answers 99 for a",
+    a: () => ({ b: 2, a: 1 }),
+    b: () => lyingProxy({ a: 1, b: 2 }, "a", 99),
+    strict: [false, true],
+    loose: [false, true],
+    looseBug: [undefined, "reports not equal"],
+  },
+  {
+    first: "{ b: 2, a: 99 }",
+    second: "a Proxy of { a: 1, b: 2 } whose get trap answers 99 for a",
+    a: () => ({ b: 2, a: 99 }),
+    b: () => lyingProxy({ a: 1, b: 2 }, "a", 99),
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: [undefined, "reports equal"],
+  },
+  // An accessor descriptor has no value: node reads the first operand with [[Get]] after all.
+  {
+    first: "{ b: 2, a: 1 }",
+    second: "a Proxy of { get a() { return 1 }, b: 2 } whose get trap answers 99 for a",
+    a: () => ({ b: 2, a: 1 }),
+    b: () =>
+      lyingProxy(
+        {
+          get a() {
+            return 1;
+          },
+          b: 2,
+        },
+        "a",
+        99,
+      ),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "{ b: 2, a: 99 }",
+    second: "a Proxy of { get a() { return 1 }, b: 2 } whose get trap answers 99 for a",
+    a: () => ({ b: 2, a: 99 }),
+    b: () =>
+      lyingProxy(
+        {
+          get a() {
+            return 1;
+          },
+          b: 2,
+        },
+        "a",
+        99,
+      ),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "{ a: 5 }",
+    second: "a Proxy of { a: 1 } whose getOwnPropertyDescriptor trap answers 5 for a",
+    a: () => ({ a: 5 }),
+    b: () => proxyWithDescriptor({ a: 1 }, "a", 5),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "{ b: 2, a: 5 }",
+    second: "a Proxy of { a: 1, b: 2 } whose getOwnPropertyDescriptor trap answers 5 for a",
+    a: () => ({ b: 2, a: 5 }),
+    b: () => proxyWithDescriptor({ a: 1, b: 2 }, "a", 5),
+    strict: [false, true],
+    loose: [false, true],
+    looseBug: [undefined, "reports not equal"],
+  },
+  // Arrays: node reads every element with [[Get]] and takes the other keys of the first operand from its descriptors.
+  {
+    first: "[1, 2]",
+    second: "a Proxy of [1, 2] whose get trap answers 9 for 0",
+    a: () => [1, 2],
+    b: () => lyingProxy([1, 2], "0", 9),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "[9, 2]",
+    second: "a Proxy of [1, 2] whose get trap answers 9 for 0",
+    a: () => [9, 2],
+    b: () => lyingProxy([1, 2], "0", 9),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "[1] with x: 1",
+    second: "a Proxy of [1] with x: 1 whose get trap answers 2 for x",
+    a: () => Object.assign([1], { x: 1 }),
+    b: () => lyingProxy(Object.assign([1], { x: 1 }), "x", 2),
+    strict: [false, true],
+    loose: [false, true],
+    looseBug: [undefined, "reports not equal"],
+  },
+  {
+    first: "[1] with x: 2",
+    second: "a Proxy of [1] with x: 1 whose get trap answers 2 for x",
+    a: () => Object.assign([1], { x: 2 }),
+    b: () => lyingProxy(Object.assign([1], { x: 1 }), "x", 2),
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: [undefined, "reports equal"],
+  },
+  // No Proxy: node lists the keys of both operands before it reads a value. It still reads a key that a getter deleted.
+  {
+    first: "{ a: 1, b: undefined }",
+    second: "{ get a() { delete this.b; return 1 }, b: 2 }",
+    a: () => ({ a: 1, b: undefined }),
+    b: () => ({
+      get a() {
+        delete this.b;
+        return 1;
+      },
+      b: 2,
+    }),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "[1] with x: 1, y: undefined",
+    second: "[1] with a getter x that deletes y, and y: 2",
+    a: () => Object.assign([1], { x: 1, y: undefined }),
+    b: () => withGetterThatDeletes([1]),
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: [undefined, "reports equal"],
+  },
+  {
+    first: "a Uint8Array with x: 1, y: undefined",
+    second: "a Uint8Array with a getter x that deletes y, and y: 2",
+    a: () => Object.assign(new Uint8Array(1), { x: 1, y: undefined }),
+    b: () => withGetterThatDeletes(new Uint8Array(1)),
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: [undefined, "reports equal"],
+  },
+  // Read through the global, `self` is the global. Its own property descriptor holds the sandbox.
+  {
+    first: "a self-referencing object",
+    second: "the global of a node:vm context over a self-referencing sandbox",
+    a: selfReferencingObject,
+    b: () => vm.runInContext("this", vm.createContext(selfReferencingObject())),
+    strict: [true, true],
+    loose: [true, true],
+    looseBug: ["reports not equal", undefined],
+  },
+  {
+    first: "{ self: itself, k: 1 }",
+    second: "the global of a node:vm context over { k: 1, self: itself }",
+    a: () => selfReferencingWith({ k: 1 }, true),
+    b: () => vm.runInContext("this", vm.createContext(selfReferencingWith({ k: 1 }, false))),
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: ["reports not equal", "reports equal"],
+  },
+  // After the first difference in key order, every later key of the first operand is read from its descriptor.
+  {
+    first: "{ b: 2, a: 1, c: 3 }",
+    second: "a Proxy of { a: 1, b: 2, c: 3 } whose get trap answers 99 for c",
+    a: () => ({ b: 2, a: 1, c: 3 }),
+    b: () => lyingProxy({ a: 1, b: 2, c: 3 }, "c", 99),
+    strict: [false, true],
+    loose: [false, true],
+    looseBug: [undefined, "reports not equal"],
+  },
+  {
+    first: "{ b: 2, a: 1, c: 99 }",
+    second: "a Proxy of { a: 1, b: 2, c: 3 } whose get trap answers 99 for c",
+    a: () => ({ b: 2, a: 1, c: 99 }),
+    b: () => lyingProxy({ a: 1, b: 2, c: 3 }, "c", 99),
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: [undefined, "reports equal"],
+  },
+  {
+    first: "{ a: 99, c: 3, b: 2 }",
+    second: "a Proxy of { a: 1, b: 2, c: 3 } whose get trap answers 99 for a",
+    a: () => ({ a: 99, c: 3, b: 2 }),
+    b: () => lyingProxy({ a: 1, b: 2, c: 3 }, "a", 99),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "{ a: 1, c: 3, b: 2 }",
+    second: "a Proxy of { a: 1, b: 2, c: 3 } whose get trap answers 99 for a",
+    a: () => ({ a: 1, c: 3, b: 2 }),
+    b: () => lyingProxy({ a: 1, b: 2, c: 3 }, "a", 99),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  // A descriptor that holds undefined is a data descriptor all the same.
+  {
+    first: "{ b: 2, a: 5 }",
+    second: "a Proxy of { a: undefined, b: 2 } whose get trap answers 5 for a",
+    a: () => ({ b: 2, a: 5 }),
+    b: () => lyingProxy({ a: undefined, b: 2 }, "a", 5),
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: [undefined, "reports equal"],
+  },
+  {
+    first: "{ b: 2, a: undefined }",
+    second: "a Proxy of { a: undefined, b: 2 } whose get trap answers 5 for a",
+    a: () => ({ b: 2, a: undefined }),
+    b: () => lyingProxy({ a: undefined, b: 2 }, "a", 5),
+    strict: [false, true],
+    loose: [false, true],
+    looseBug: [undefined, "reports not equal"],
+  },
+  // The first operand has to own each key of the second, enumerable.
+  {
+    first: "{ x: 1 }",
+    second: "{ y: 2 } with a non-enumerable x: 1",
+    a: () => ({ x: 1 }),
+    b: () => Object.defineProperty({ y: 2 }, "x", { value: 1 }),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "[1] with x: 1",
+    second: "[1] with y: 2 and a non-enumerable x: 1",
+    a: () => Object.assign([1], { x: 1 }),
+    b: () => Object.defineProperty(Object.assign([1], { y: 2 }), "x", { value: 1 }),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  {
+    first: "a Uint8Array with x: 1",
+    second: "a Uint8Array with y: 2 and a non-enumerable x: 1",
+    a: () => Object.assign(new Uint8Array(1), { x: 1 }),
+    b: () => Object.defineProperty(Object.assign(new Uint8Array(1), { y: 2 }), "x", { value: 1 }),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  // Node lists string keys before symbol keys, whatever order an object or an ownKeys trap has them in.
+  {
+    first: "{ a: 1, [sym]: 2 }",
+    second: "a Proxy of { a: 1, [sym]: 2 } that lists sym before a and whose get trap answers 99 for a",
+    a: () => ({ a: 1, [sym]: 2 }),
+    b: () => proxyWithKeysReversed({ a: 1, [sym]: 2 }, { get: (t, k, r) => (k === "a" ? 99 : Reflect.get(t, k, r)) }),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "{ a: 99, [sym]: 2 }",
+    second: "a Proxy of { a: 1, [sym]: 2 } that lists sym before a and whose get trap answers 99 for a",
+    a: () => ({ a: 99, [sym]: 2 }),
+    b: () => proxyWithKeysReversed({ a: 1, [sym]: 2 }, { get: (t, k, r) => (k === "a" ? 99 : Reflect.get(t, k, r)) }),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "{ [sym]: 2, a: 1 }",
+    second: "{ a: 1, [sym]: 2 }",
+    a: () => ({ [sym]: 2, a: 1 }),
+    b: () => ({ a: 1, [sym]: 2 }),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  // Both operands need the same number of string keys before any value is read.
+  {
+    first: "{ get a() { this[sym] = 2; return 1 }, b: 2 }",
+    second: "{ a: 1, [sym]: 2 }",
+    a: () => ({
+      get a() {
+        (this as any)[sym] = 2;
+        return 1;
+      },
+      b: 2,
+    }),
+    b: () => ({ a: 1, [sym]: 2 }),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: [undefined, "reports equal"],
+  },
+  {
+    first: "{ a: 1, b: 2 }",
+    second: "{ get a() { throw }, [sym]: 2 }",
+    a: () => ({ a: 1, b: 2 }),
+    b: () => ({
+      get a(): number {
+        throw new RangeError("from the getter");
+      },
+      [sym]: 2,
+    }),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["throws a RangeError", "throws a RangeError"],
+  },
+  // A pair of arrays that holds a Proxy: length and elements by [[Get]], other keys as above.
+  {
+    first: "[1, 2]",
+    second: "a Proxy of [1, 2] whose get trap answers 3 for length",
+    a: () => [1, 2],
+    b: () => lyingProxy([1, 2], "length", 3),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  {
+    first: "[9, 2]",
+    second: "a Proxy of [1, 2] whose get trap answers 3 for length and 9 for 0",
+    a: () => [9, 2],
+    b: () => new Proxy([1, 2], { get: (t, k, r) => (k === "length" ? 3 : k === "0" ? 9 : Reflect.get(t, k, r)) }),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  {
+    first: "[1, 2]",
+    second: "a Proxy of [1, 2] whose get trap answers '2' for length",
+    a: () => [1, 2],
+    b: () => lyingProxy([1, 2], "length", "2"),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  {
+    first: "[9] with x: 1",
+    second: "a Proxy of [1] with x: 1 that lists x before 0 and whose get trap answers 9 for 0",
+    a: () => Object.assign([9], { x: 1 }),
+    b: () =>
+      proxyWithKeysReversed(Object.assign([1], { x: 1 }), { get: (t, k, r) => (k === "0" ? 9 : Reflect.get(t, k, r)) }),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "[1] with x: 1",
+    second: "a Proxy of [1] with x: 1 that lists x before 0 and whose get trap answers 9 for 0",
+    a: () => Object.assign([1], { x: 1 }),
+    b: () =>
+      proxyWithKeysReversed(Object.assign([1], { x: 1 }), { get: (t, k, r) => (k === "0" ? 9 : Reflect.get(t, k, r)) }),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "[1, , 3]",
+    second: "a Proxy of [1, undefined, 3]",
+    a: () => [1, , 3],
+    b: () => new Proxy([1, undefined, 3], {}),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: [undefined, "reports equal"],
+  },
+  {
+    first: "[1, , 3]",
+    second: "a Proxy of [1, , 3]",
+    a: () => [1, , 3],
+    b: () => new Proxy([1, , 3], {}),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  // From the first hole on, node reads the rest of both arrays again by key, with [[Get]] on both.
+  {
+    first: "[1, , 3] with x: 1",
+    second: "a Proxy of [1, , 3] with x: 1 whose get trap answers 2 for x",
+    a: () => sparseArray({ x: 1 }),
+    b: () => lyingProxy(sparseArray({ x: 1 }), "x", 2),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "[1, , 3] with x: 2",
+    second: "a Proxy of [1, , 3] with x: 1 whose get trap answers 2 for x",
+    a: () => sparseArray({ x: 2 }),
+    b: () => lyingProxy(sparseArray({ x: 1 }), "x", 2),
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: [undefined, "reports equal"],
+  },
+  {
+    first: "[1, , 3] with x: 5",
+    second: "a Proxy of [1, , 3] with x: 1 whose getOwnPropertyDescriptor trap answers 5 for x",
+    a: () => sparseArray({ x: 5 }),
+    b: () => proxyWithDescriptor(sparseArray({ x: 1 }), "x", 5),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "[, 1] with x: 1, y: undefined",
+    second: "[, 1] with a getter x that deletes y, and y: 2",
+    a: () => Object.assign([, 1], { x: 1, y: undefined }),
+    b: () => withGetterThatDeletes([, 1]),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  // Cycles behind a Proxy.
+  {
+    first: "a self-referencing object",
+    second: "a deep Proxy of one",
+    a: selfReferencingObject,
+    b: () => deepProxy(selfReferencingObject()),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "a deep Proxy of a self-referencing object",
+    second: "another one",
+    a: () => deepProxy(selfReferencingObject()),
+    b: () => deepProxy(selfReferencingObject()),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "a self-referencing array",
+    second: "a deep Proxy of one",
+    a: selfReferencingArray,
+    b: () => deepProxy(selfReferencingArray()),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "{ self: itself, a: 1 }",
+    second: "a deep Proxy of { a: 1, self: itself }",
+    a: () => selfReferencingWith({ a: 1 }, true),
+    b: () => deepProxy(selfReferencingWith({ a: 1 }, false)),
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: [undefined, "reports equal"],
+  },
+  // A Proxy that unwraps refs: its own property descriptor holds the ref, a read gives the value.
+  {
+    first: "a Proxy that unwraps the ref in { count: ref(1), name: 'x' }",
+    second: "another one",
+    a: () => unwrappingProxy({ count: ref(1), name: "x" }),
+    b: () => unwrappingProxy({ count: ref(1), name: "x" }),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "{ count: 1, name: 'x' }",
+    second: "a Proxy that unwraps the ref in { count: ref(1), name: 'x' }",
+    a: () => ({ count: 1, name: "x" }),
+    b: () => unwrappingProxy({ count: ref(1), name: "x" }),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "{ name: 'x', count: 1 }",
+    second: "a Proxy that unwraps the ref in { count: ref(1), name: 'x' }",
+    a: () => ({ name: "x", count: 1 }),
+    b: () => unwrappingProxy({ count: ref(1), name: "x" }),
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: [undefined, "reports equal"],
+  },
+  // An element that is an accessor is read with [[Get]], on either operand.
+  {
+    first: "[1, 2, 3]",
+    second: "[1, 2, 3] whose second element is a getter",
+    a: () => [1, 2, 3],
+    b: () => withAccessorElement([1, 2, 3], 1, 2),
+    strict: [true, true],
+    loose: [true, true],
+    looseBug: ["reports not equal", "reports not equal"],
+  },
+  {
+    first: "[1, 9, 3]",
+    second: "[1, 2, 3] whose second element is a getter",
+    a: () => [1, 9, 3],
+    b: () => withAccessorElement([1, 2, 3], 1, 2),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "[1, 2, 3] whose second element is a getter",
+    second: "[1, 9, 3] whose second element is a getter",
+    a: () => withAccessorElement([1, 2, 3], 1, 2),
+    b: () => withAccessorElement([1, 9, 3], 1, 9),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  {
+    first: "[1, 2, 3] whose second element is a getter, with a getter x",
+    second: "another such array",
+    a: () => withGetterX(withAccessorElement([1, 2, 3], 1, 2)),
+    b: () => withGetterX(withAccessorElement([1, 2, 3], 1, 2)),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  // Node reads the length of the first array again for each element: a getter that ran before can change it.
+  {
+    first: "[1, 2, 3] with a getter x that sets its length to 1",
+    second: "[1, 2, 3] with x: 1",
+    a: () => withGetterX([1, 2, 3], array => void (array.length = 1)),
+    b: () => Object.assign([1, 2, 3], { x: 1 }),
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: [undefined, "reports equal"],
+  },
+  {
+    first: "[1, 2, 3] with a getter x that pushes a fourth element",
+    second: "[1, 2, 3] with x: 1",
+    a: () => withGetterX([1, 2, 3], array => void array.push(4)),
+    b: () => Object.assign([1, 2, 3], { x: 1 }),
+    strict: [false, true],
+    loose: [false, true],
+    looseBug: ["reports equal", undefined],
+  },
+  {
+    first: "[] with a getter x that pushes an element",
+    second: "[] with x: 1",
+    a: () => withGetterX([] as number[], array => void array.push(1)),
+    b: () => Object.assign([], { x: 1 }),
+    strict: [false, true],
+    loose: [false, true],
+    looseBug: ["reports equal", undefined],
+  },
+  // A function, and a Proxy of one, is equal to nothing but itself.
+  {
+    first: "a Proxy of a function",
+    second: "a Proxy of another function",
+    a: () => new Proxy(function () {}, {}),
+    b: () => new Proxy(function () {}, {}),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  {
+    first: "{ h: a Proxy of a function }",
+    second: "{ h: a Proxy of another function }",
+    a: () => ({ h: new Proxy(function () {}, {}) }),
+    b: () => ({ h: new Proxy(function () {}, {}) }),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  {
+    first: "a Proxy of a function",
+    second: "{}",
+    a: () => new Proxy(function () {}, {}),
+    b: () => ({}),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  // More pairs of arrays that hold a Proxy.
+  {
+    first: "[1]",
+    second: "a Proxy of [undefined]",
+    a: () => [1],
+    b: () => new Proxy([undefined], {}),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "[1] with x: 1, y: 2",
+    second: "a Proxy of [1] with x: 1",
+    a: () => Object.assign([1], { x: 1, y: 2 }),
+    b: () => new Proxy(Object.assign([1], { x: 1 }), {}),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "[1, 2, 3]",
+    second: "a Proxy of [1, 2, 3, 4, 5] whose get trap answers 3 for length",
+    a: () => [1, 2, 3],
+    b: () => lyingProxy([1, 2, 3, 4, 5], "length", 3),
+    strict: [true, true],
+    loose: [true, true],
+    looseBug: ["reports not equal", "reports not equal"],
+  },
+  {
+    first: "[1, 1, 1]",
+    second: "a Proxy of [] whose get trap answers 3 for length and 1 for every index",
+    a: () => [1, 1, 1],
+    b: () =>
+      virtualArray(
+        () => 3,
+        () => 1,
+      ),
+    strict: [true, true],
+    loose: [true, true],
+    looseBug: ["reports not equal", "reports not equal"],
+  },
+  {
+    first: "a Proxy of [] whose get trap answers 3 for length and 1 for every index",
+    second: "a Proxy of [] whose get trap answers 3 for length and 2 for every index",
+    a: () =>
+      virtualArray(
+        () => 3,
+        () => 1,
+      ),
+    b: () =>
+      virtualArray(
+        () => 3,
+        () => 2,
+      ),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  // The length of the first array is read again for each element: a Proxy can answer less each time.
+  {
+    first: "a Proxy of [] whose length reads 3, 3, then 1, with 1 for every index",
+    second: "[1, 9, 9]",
+    a: () => {
+      let reads = 0;
+      return virtualArray(
+        () => (reads++ < 2 ? 3 : 1),
+        () => 1,
+      );
+    },
+    b: () => [1, 9, 9],
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: ["reports not equal", undefined],
+  },
+  // With no other key, node takes `val2.size === 0` for two equal arrays (keyCheck).
+  {
+    first: "[1, 2]",
+    second: "a Proxy of [3, 4] whose get trap answers 0 for size",
+    a: () => [1, 2],
+    b: () => lyingProxy([3, 4], "size", 0),
+    strict: [true, false],
+    loose: [true, false],
+    looseBug: ["reports not equal", undefined],
+  },
+  // Arrays with holes and other keys.
+  {
+    first: "[1]",
+    second: "[1] with x: 1",
+    a: () => [1],
+    b: () => Object.assign([1], { x: 1 }),
+    strict: [false, false],
+    loose: [false, false],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  {
+    first: "[1, , , 4] with x: 1",
+    second: "[1, , undefined, ,] with x: 1",
+    a: () => Object.assign([1, , , 4], { x: 1 }),
+    b: () => Object.assign([1, , undefined, ,], { x: 1 }),
+    strict: [false, false],
+    loose: [false, false],
+  },
+  {
+    first: "[1, , 3] whose third element is a getter",
+    second: "[1, , 3]",
+    a: () => withAccessorElement([1, , 3], 2, 3),
+    b: () => [1, , 3],
+    strict: [true, true],
+    loose: [true, true],
+    looseBug: ["reports not equal", "reports not equal"],
+  },
+  // A private field is no property: node compares none of them.
+  {
+    first: "a class instance whose private field holds 1",
+    second: "an instance of that class whose private field holds 2",
+    a: () => new WithPrivate(1),
+    b: () => new WithPrivate(2),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "a class instance with a private field that holds 1, then a symbol key",
+    second: "an instance of that class whose private field holds 2",
+    a: () => new PrivateThenSymbol(1),
+    b: () => new PrivateThenSymbol(2),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  {
+    first: "a class instance with a symbol key, then a private field that holds 1",
+    second: "an instance of that class whose private field holds 2",
+    a: () => new SymbolThenPrivate(1),
+    b: () => new SymbolThenPrivate(2),
+    strict: [true, true],
+    loose: [true, true],
+  },
+  // Known differences: Map and Set entries, and the keys of an Error, are still read by other walks.
+  {
+    first: "a Map holding { b: 2, a: 1 }",
+    second: "a Map holding a Proxy of { a: 1, b: 2 } whose get trap answers 99 for a",
+    a: () => new Map([["k", { b: 2, a: 1 }]]),
+    b: () => new Map([["k", lyingProxy({ a: 1, b: 2 }, "a", 99)]]),
+    strict: [false, true],
+    loose: [false, true],
+    strictBug: [undefined, "reports not equal"],
+    looseBug: [undefined, "reports not equal"],
+  },
+  {
+    first: "a Set holding { b: 2, a: 1 }",
+    second: "a Set holding a Proxy of { a: 1, b: 2 } whose get trap answers 99 for a",
+    a: () => new Set([{ b: 2, a: 1 }]),
+    b: () => new Set([lyingProxy({ a: 1, b: 2 }, "a", 99)]),
+    strict: [false, true],
+    loose: [false, true],
+    strictBug: [undefined, "reports not equal"],
+    looseBug: [undefined, "reports not equal"],
+  },
+  {
+    first: "an Error with x: 1",
+    second: "an Error with y: 1 and a non-enumerable x: 1",
+    a: () => Object.assign(new Error("m"), { x: 1 }),
+    b: () => Object.defineProperty(Object.assign(new Error("m"), { y: 1 }), "x", { value: 1 }),
+    strict: [false, false],
+    loose: [false, false],
+    strictBug: ["reports equal", undefined],
+    looseBug: ["reports equal", undefined],
+  },
+  {
+    first: "an Error with an enumerable stack 'A'",
+    second: "an Error with an enumerable stack 'B'",
+    a: () => Object.defineProperty(new Error("m"), "stack", { value: "A", enumerable: true }),
+    b: () => Object.defineProperty(new Error("m"), "stack", { value: "B", enumerable: true }),
+    strict: [false, false],
+    loose: [false, false],
+    strictBug: ["reports equal", "reports equal"],
+    looseBug: ["reports equal", "reports equal"],
+  },
+  // Known difference: two objects of one shape are compared from values that are all read first.
+  {
+    first: "{ a: { get b() { delete the b of the parent } }, b: 1 }",
+    second: "{ a: { get b() { delete the b of the parent } }, b: {} }",
+    a: () => withChildThatDeletesB(1),
+    b: () => withChildThatDeletesB({}),
+    strict: [true, true],
+    loose: [true, true],
+    strictBug: ["reports not equal", "reports not equal"],
+    looseBug: ["reports not equal", "reports not equal"],
+  },
+  // Known difference: a Map or a Set compares a pair of entries more than once, so such a getter runs too often.
+  {
+    first: "a Map holding [<hole>] with a getter x that pushes an element",
+    second: "another such Map",
+    a: () => new Map([["k", withGetterX(new Array<number>(1), array => void array.push(1))]]),
+    b: () => new Map([["k", withGetterX(new Array<number>(1), array => void array.push(1))]]),
+    strict: [true, true],
+    loose: [true, true],
+    strictBug: ["reports not equal", "reports not equal"],
+  },
+];
+
+for (const { first, second, a, b, strict, loose, strictBug, looseBug } of orderedPairs) {
+  cases.push(
+    {
+      name: `${first} and ${second}`,
+      a,
+      b,
+      strict: strict[0],
+      loose: loose[0],
+      strictBug: strictBug?.[0],
+      looseBug: looseBug?.[0],
+    },
+    {
+      name: `${second} and ${first}`,
+      a: b,
+      b: a,
+      strict: strict[1],
+      loose: loose[1],
+      strictBug: strictBug?.[1],
+      looseBug: looseBug?.[1],
+    },
+  );
+}
+
 function caught(fn: () => void): (Error & { code?: string }) | null {
   try {
     fn();
@@ -1185,6 +2220,540 @@ describe("util.isDeepStrictEqual", () => {
     assert.strictEqual(calls, 2);
   });
 
+  describe("how the operands are read", () => {
+    // Logs the get and getOwnPropertyDescriptor traps of `target`.
+    function traced(name: string, target: object, log: string[]) {
+      return new Proxy(target, {
+        get(t, key, receiver) {
+          if (typeof key === "string" && key !== "constructor") log.push(`${name}.get:${key}`);
+          return Reflect.get(t, key, receiver);
+        },
+        getOwnPropertyDescriptor(t, key) {
+          log.push(`${name}.getOwnPropertyDescriptor:${String(key)}`);
+          return Reflect.getOwnPropertyDescriptor(t, key);
+        },
+      });
+    }
+
+    // Both logs are Node's: the keys of the second operand are listed first, then the values are read.
+    test("with [[Get]] on both operands while their keys are in the same order", () => {
+      const log: string[] = [];
+      const equal = util.isDeepStrictEqual(traced("first", { a: 1, b: 2 }, log), traced("second", { a: 1, b: 2 }, log));
+      same(
+        { equal, log },
+        {
+          equal: true,
+          log: [
+            "second.getOwnPropertyDescriptor:a",
+            "second.getOwnPropertyDescriptor:b",
+            "first.getOwnPropertyDescriptor:a",
+            "first.getOwnPropertyDescriptor:b",
+            "first.get:a",
+            "second.get:a",
+            "first.get:b",
+            "second.get:b",
+          ],
+        },
+      );
+    });
+
+    test("the first operand from its descriptors once the key orders differ", () => {
+      const log: string[] = [];
+      const equal = util.isDeepStrictEqual(traced("first", { a: 1, b: 2 }, log), traced("second", { b: 2, a: 1 }, log));
+      same(
+        { equal, log },
+        {
+          equal: true,
+          log: [
+            "second.getOwnPropertyDescriptor:b",
+            "second.getOwnPropertyDescriptor:a",
+            "first.getOwnPropertyDescriptor:a",
+            "first.getOwnPropertyDescriptor:b",
+            "first.getOwnPropertyDescriptor:b",
+            "second.get:b",
+            "first.getOwnPropertyDescriptor:a",
+            "second.get:a",
+          ],
+        },
+      );
+    });
+
+    test("each value once, up to the first difference", () => {
+      const log: string[] = [];
+      const equal = util.isDeepStrictEqual(
+        traced("first", { a: 1, b: 2, c: 3 }, log),
+        traced("second", { a: 1, b: 9, c: 3 }, log),
+      );
+      same(
+        { equal, reads: log.filter(entry => entry.includes(".get:")) },
+        { equal: false, reads: ["first.get:a", "second.get:a", "first.get:b", "second.get:b"] },
+      );
+    });
+
+    test("in the key order of the second operand", () => {
+      const withThrowingGetter = () => ({
+        b: 2,
+        get a(): number {
+          throw new RangeError("from the getter");
+        },
+      });
+      // `b` differs and comes first in the second operand: `a` is never read.
+      assert.strictEqual(util.isDeepStrictEqual({ a: 1, b: 1 }, withThrowingGetter()), false);
+      assert.throws(() => util.isDeepStrictEqual(withThrowingGetter(), { a: 1, b: 1 }), {
+        name: "RangeError",
+        message: "from the getter",
+      });
+    });
+
+    test("an error from a get trap of either operand is thrown", () => {
+      const throwing = () =>
+        new Proxy(
+          { a: 1 },
+          {
+            get(t, key, receiver) {
+              if (key === "a") throw new RangeError("from the get trap");
+              return Reflect.get(t, key, receiver);
+            },
+          },
+        );
+      assert.throws(() => util.isDeepStrictEqual({ a: 1 }, throwing()), {
+        name: "RangeError",
+        message: "from the get trap",
+      });
+      assert.throws(() => util.isDeepStrictEqual(throwing(), { a: 1 }), {
+        name: "RangeError",
+        message: "from the get trap",
+      });
+
+      // The trap answers 2 for a property that is fixed at 1, which [[Get]] rejects.
+      const inconsistent = () => lyingProxy(Object.freeze({ a: 1 }), "a", 2);
+      assert.throws(() => util.isDeepStrictEqual({ a: 1 }, inconsistent()), TypeError);
+      assert.throws(() => util.isDeepStrictEqual(inconsistent(), { a: 1 }), TypeError);
+
+      // A getter of one operand revokes the other operand before its next value is read.
+      const revokedMidway = (): [object, object] => {
+        const { proxy, revoke } = Proxy.revocable({ a: 1, b: 2 }, {});
+        return [
+          {
+            get a() {
+              revoke();
+              return 1;
+            },
+            b: 2,
+          },
+          proxy,
+        ];
+      };
+      assert.throws(() => util.isDeepStrictEqual(...revokedMidway()), TypeError);
+      assert.throws(() => util.isDeepStrictEqual(...(revokedMidway().reverse() as [object, object])), TypeError);
+    });
+
+    test("assert.throws compares a property of its validation object through the get trap", () => {
+      const thrower = () => {
+        throw Object.assign(new Error("m"), { info: { a: 1 } });
+      };
+      assert.doesNotThrow(() => assert.throws(thrower, { info: new Proxy({ a: 1 }, {}) }));
+      assert.throws(() => assert.throws(thrower, { info: lyingProxy({ a: 1 }, "a", 2) }), assert.AssertionError);
+    });
+
+    test("every key after the first difference in key order from the descriptor", () => {
+      const log: string[] = [];
+      const equal = util.isDeepStrictEqual(
+        traced("first", { a: 1, b: 2, c: 3 }, log),
+        traced("second", { a: 1, c: 3, b: 2 }, log),
+      );
+      // The first six entries list the keys of both operands.
+      same(
+        { equal, reads: log.slice(6) },
+        {
+          equal: true,
+          reads: [
+            "first.get:a",
+            "second.get:a",
+            "first.getOwnPropertyDescriptor:c",
+            "second.get:c",
+            "first.getOwnPropertyDescriptor:b",
+            "second.get:b",
+          ],
+        },
+      );
+    });
+
+    test("string keys before symbol keys", () => {
+      const s = Symbol("k");
+      const log: string[] = [];
+      const make = (who: string) => ({
+        get [s]() {
+          log.push(`${who}.symbol`);
+          return 1;
+        },
+        get a() {
+          log.push(`${who}.a`);
+          return 1;
+        },
+      });
+      assert.strictEqual(util.isDeepStrictEqual(make("first"), make("second")), true);
+      same(log, ["first.a", "second.a", "first.symbol", "second.symbol"]);
+    });
+
+    test("string keys before symbol keys of two objects of one shape", () => {
+      const s = Symbol("k");
+      const log: string[] = [];
+      const make = (who: string) => ({
+        [s]: traced(`${who}.symbol`, { v: 1 }, log),
+        a: traced(`${who}.a`, { v: 1 }, log),
+      });
+      assert.strictEqual(util.isDeepStrictEqual(make("first"), make("second")), true);
+      same(
+        log.filter(entry => entry.includes(".get:")),
+        ["first.a.get:v", "second.a.get:v", "first.symbol.get:v", "second.symbol.get:v"],
+      );
+
+      const throwing = (message: string) => ({
+        get x() {
+          throw new RangeError(message);
+        },
+      });
+      const makeThrowing = () => ({ [s]: throwing("under the symbol"), a: throwing("under a"), hidden: 1 });
+      const withHidden = () => Object.defineProperty(makeThrowing(), "hidden", { enumerable: false });
+      assert.throws(() => util.isDeepStrictEqual(makeThrowing(), makeThrowing()), {
+        name: "RangeError",
+        message: "under a",
+      });
+      assert.throws(() => util.isDeepStrictEqual(withHidden(), withHidden()), {
+        name: "RangeError",
+        message: "under a",
+      });
+    });
+
+    test("no value when the operands differ in their number of string keys", () => {
+      let calls = 0;
+      const withGetter = () => ({
+        get a(): number {
+          calls++;
+          throw new RangeError("from the getter");
+        },
+        [sym]: 2,
+      });
+      assert.strictEqual(util.isDeepStrictEqual({ a: 1, b: 2 }, withGetter()), false);
+      assert.strictEqual(util.isDeepStrictEqual(withGetter(), { a: 1, b: 2 }), false);
+      assert.doesNotThrow(() => assert.notDeepStrictEqual({ a: 1, b: 2 }, withGetter()));
+      assert.strictEqual(calls, 0);
+    });
+
+    test("a Proxy that makes a new Proxy for each read of a cycle runs out of stack, as in Node", () => {
+      const fresh = <T extends object>(target: T): T =>
+        new Proxy(target, {
+          get(t, key, receiver) {
+            const value = Reflect.get(t, key, receiver);
+            return typeof value === "object" && value !== null ? fresh(value) : value;
+          },
+        });
+      const make = () => fresh(selfReferencingWith({ a: 1 }, false));
+      assert.throws(() => util.isDeepStrictEqual(make(), make()), RangeError);
+      assert.throws(() => assert.deepStrictEqual(make(), make()), RangeError);
+      assert.throws(() => assert.notDeepStrictEqual(make(), make()), RangeError);
+      assert.strictEqual(util.isDeepStrictEqual(selfReferencingWith({ a: 1 }, false), make()), false);
+    });
+
+    test("an accessor of a node:vm sandbox through the global, once", () => {
+      let calls = 0;
+      const sandbox = {
+        b: 2,
+        get me() {
+          calls++;
+          return sandbox;
+        },
+      };
+      const global = vm.runInContext("this", vm.createContext(sandbox));
+      // Read through the global, `me` is the global. The getter's own answer is the sandbox.
+      same([util.isDeepStrictEqual(global, { me: global, b: 2 }), calls], [true, 1]);
+      calls = 0;
+      same([util.isDeepStrictEqual({ me: global, b: 2 }, global), calls], [true, 1]);
+    });
+
+    for (const [name, make] of [
+      ["an array", () => [1] as object],
+      ["a Uint8Array", () => new Uint8Array(1) as object],
+      ["a DataView", () => new DataView(new ArrayBuffer(1)) as object],
+    ] as const) {
+      describe(`the other keys of ${name}`, () => {
+        const withGetters = (who: string, keys: string[], log: string[]) => {
+          const object = make();
+          for (const key of keys) {
+            Object.defineProperty(object, key, {
+              enumerable: true,
+              get() {
+                log.push(`${who}.${key}`);
+                return 1;
+              },
+            });
+          }
+          return object;
+        };
+        const withThrowingGetter = (message: string, before: object = {}, after: object = {}) =>
+          Object.assign(
+            Object.defineProperty(Object.assign(make(), before), "x", {
+              enumerable: true,
+              get() {
+                throw new RangeError(message);
+              },
+            }),
+            after,
+          );
+
+        test("first operand, then second, in the key order of the second", () => {
+          const log: string[] = [];
+          const equal = util.isDeepStrictEqual(
+            withGetters("first", ["x", "y"], log),
+            withGetters("second", ["y", "x"], log),
+          );
+          same({ equal, log }, { equal: true, log: ["first.y", "second.y", "first.x", "second.x"] });
+        });
+
+        test("the error of the first operand when a getter of each throws", () => {
+          assert.throws(() => util.isDeepStrictEqual(withThrowingGetter("first"), withThrowingGetter("second")), {
+            name: "RangeError",
+            message: "first",
+          });
+        });
+
+        test("no later key once one differs", () => {
+          // `y` differs and comes first in the second operand: the getter `x` never runs.
+          assert.strictEqual(
+            util.isDeepStrictEqual(withThrowingGetter("x", {}, { y: 1 }), withThrowingGetter("x", { y: 2 })),
+            false,
+          );
+          assert.throws(
+            () => util.isDeepStrictEqual(withThrowingGetter("x", { y: 2 }), withThrowingGetter("x", {}, { y: 1 })),
+            { name: "RangeError", message: "x" },
+          );
+        });
+      });
+    }
+
+    test("the other keys of an array before its elements", () => {
+      const withThrowingKey = () =>
+        Object.defineProperty([2], "x", {
+          enumerable: true,
+          get() {
+            throw new RangeError("from the getter");
+          },
+        });
+      // The elements differ, but the getter `x` runs first.
+      assert.throws(() => util.isDeepStrictEqual(Object.assign([1], { x: {} }), withThrowingKey()), {
+        name: "RangeError",
+        message: "from the getter",
+      });
+      assert.throws(() => util.isDeepStrictEqual(withThrowingKey(), Object.assign([1], { x: {} })), {
+        name: "RangeError",
+        message: "from the getter",
+      });
+    });
+
+    test("each element of an array behind a Proxy twice, second operand first", () => {
+      const log: string[] = [];
+      const logged = (who: string, target: object) =>
+        new Proxy(target, {
+          get(t, key, receiver) {
+            if (typeof key === "string" && key !== "constructor" && key !== "length") log.push(`${who}.${key}`);
+            return Reflect.get(t, key, receiver);
+          },
+        });
+      const equal = util.isDeepStrictEqual(
+        logged("first", Object.assign([1, 2], { x: 1 })),
+        logged("second", Object.assign([1, 2], { x: 1 })),
+      );
+      // Node reads b[i], then a[i], then both again to compare them. `first.x` comes from a descriptor.
+      same(
+        { equal, log },
+        {
+          equal: true,
+          log: ["second.x", "second.0", "first.0", "first.0", "second.0", "second.1", "first.1", "first.1", "second.1"],
+        },
+      );
+    });
+
+    test("the other keys of an array again after a hole", () => {
+      const log: string[] = [];
+      const withGetter = (who: string, array: unknown[]) =>
+        Object.defineProperty(array, "x", {
+          enumerable: true,
+          get() {
+            log.push(who);
+            return 1;
+          },
+        });
+      assert.strictEqual(util.isDeepStrictEqual(withGetter("first", [1]), withGetter("second", [1])), true);
+      same(log, ["first", "second"]);
+      log.length = 0;
+      assert.strictEqual(util.isDeepStrictEqual(withGetter("first", [, 1]), withGetter("second", [, 1])), true);
+      same(log, ["first", "second", "first", "first", "second"]);
+    });
+
+    test("the symbol-keyed getter of an array on the first operand, then on the second", () => {
+      const s = Symbol("k");
+      const log: string[] = [];
+      const make = (who: string) =>
+        Object.defineProperty([1], s, {
+          enumerable: true,
+          get() {
+            log.push(who);
+            return 42;
+          },
+        });
+      assert.strictEqual(util.isDeepStrictEqual(make("first"), make("second")), true);
+      same(log, ["first", "second"]);
+    });
+
+    test("an element that is a getter twice on each operand", () => {
+      let calls = 0;
+      const counting = () =>
+        Object.defineProperty([1, 2, 3], 1, {
+          enumerable: true,
+          get() {
+            calls++;
+            return 2;
+          },
+        });
+      assert.strictEqual(util.isDeepStrictEqual([1, 2, 3], counting()), true);
+      assert.strictEqual(calls, 2);
+      assert.strictEqual(util.isDeepStrictEqual(counting(), [1, 2, 3]), true);
+      assert.strictEqual(calls, 4);
+      assert.strictEqual(util.isDeepStrictEqual(counting(), counting()), true);
+      assert.strictEqual(calls, 8);
+    });
+
+    test("the length of the first array again after each element", () => {
+      // A getter of the second array empties the first: no element is left to compare.
+      const first = withGetterX([1]);
+      const second = withGetterX([1], () => void (first.length = 0));
+      assert.strictEqual(util.isDeepStrictEqual(first, second), true);
+
+      // A getter below the first element cuts the first array off behind it.
+      const cut: unknown[] = [null, 2, 3];
+      cut[0] = {
+        get g() {
+          cut.length = 1;
+          return 0;
+        },
+      };
+      const whole = [
+        {
+          get g() {
+            return 0;
+          },
+        },
+        9,
+        9,
+      ];
+      assert.strictEqual(util.isDeepStrictEqual(cut, whole), true);
+    });
+
+    test("every trap of an array behind a Proxy that node calls, and no other", () => {
+      const log: string[] = [];
+      assert.strictEqual(util.isDeepStrictEqual([1], traced("second", [1], log)), true);
+      // With no other key, node reads `length` and `size` of the second array once more (keyCheck).
+      same(log, [
+        "second.get:length",
+        "second.getOwnPropertyDescriptor:length",
+        "second.get:length",
+        "second.get:size",
+        "second.get:0",
+        "second.get:0",
+      ]);
+      log.length = 0;
+      assert.strictEqual(util.isDeepStrictEqual(traced("first", [1], log), [1]), true);
+      same(log, [
+        "first.get:length",
+        "first.getOwnPropertyDescriptor:length",
+        "first.get:length",
+        "first.get:0",
+        "first.get:0",
+        "first.get:length",
+      ]);
+      log.length = 0;
+      assert.strictEqual(util.isDeepStrictEqual([], traced("second", [], log)), true);
+      same(log, ["second.get:length", "second.getOwnPropertyDescriptor:length", "second.get:length"]);
+    });
+
+    test("no descriptor of an index of an array behind a Proxy", () => {
+      const proxy = () =>
+        new Proxy([1], {
+          getOwnPropertyDescriptor(target, key) {
+            if (key === "0") throw new RangeError("the descriptor of an index");
+            return Reflect.getOwnPropertyDescriptor(target, key);
+          },
+        });
+      assert.strictEqual(util.isDeepStrictEqual([1], proxy()), true);
+      assert.strictEqual(util.isDeepStrictEqual(proxy(), [1]), true);
+    });
+
+    test("`size` of a second array behind a Proxy that has no other key", () => {
+      const proxy = () =>
+        new Proxy([1], {
+          get(target, key, receiver) {
+            if (key === "size") throw new RangeError("from the get trap");
+            return Reflect.get(target, key, receiver);
+          },
+        });
+      assert.throws(() => util.isDeepStrictEqual([1], proxy()), { name: "RangeError", message: "from the get trap" });
+      assert.strictEqual(util.isDeepStrictEqual(proxy(), [1]), true);
+    });
+
+    test("the symbol keys of the first operand before those of the second", () => {
+      const s = Symbol("k");
+      const proxy = (message: string) =>
+        new Proxy(
+          { [s]: 1 },
+          {
+            getOwnPropertyDescriptor(target, key) {
+              if (key === s) throw new RangeError(message);
+              return Reflect.getOwnPropertyDescriptor(target, key);
+            },
+          },
+        );
+      assert.throws(() => util.isDeepStrictEqual(proxy("first"), proxy("second")), {
+        name: "RangeError",
+        message: "first",
+      });
+    });
+
+    test("nothing of a private field, and nothing of a function", () => {
+      const log: string[] = [];
+      const first = new WithPrivate(traced("first", { v: 1 }, log));
+      const second = new WithPrivate(traced("second", { v: 2 }, log));
+      assert.strictEqual(util.isDeepStrictEqual(first, second), true);
+      same(log, []);
+
+      const callable = new Proxy(function () {}, {
+        ownKeys() {
+          throw new RangeError("from the ownKeys trap");
+        },
+      });
+      assert.strictEqual(util.isDeepStrictEqual(callable, callable), true);
+      assert.strictEqual(util.isDeepStrictEqual({ h: callable }, { h: callable }), true);
+      assert.strictEqual(util.isDeepStrictEqual(callable, new Proxy(function () {}, {})), false);
+      assert.strictEqual(util.isDeepStrictEqual(new Proxy(function () {}, {}), callable), false);
+    });
+
+    // Known difference: a Map or a Set compares its entries before its own keys. Node reads the keys first.
+    test("the own keys of a Map before its entries", { expectFailure: isBun }, () => {
+      const throwing = () =>
+        Object.defineProperty(new Map([[1, {}]]), "a", {
+          enumerable: true,
+          get() {
+            throw new RangeError("from the getter");
+          },
+        });
+      const plain = () => Object.assign(new Map([[1, 1]]), { a: 1 });
+      assert.throws(() => util.isDeepStrictEqual(plain(), throwing()), {
+        name: "RangeError",
+        message: "from the getter",
+      });
+    });
+  });
+
   // The third argument was added in Node v26.
   describe("skipPrototype", () => {
     class Foo {
@@ -1215,6 +2784,19 @@ describe("util.isDeepStrictEqual", () => {
       ["Map value", () => new Map([["k", new Foo(1)]]), () => new Map([["k", new Bar(1)]])],
       ["Set element", () => new Set([new Foo(1)]), () => new Set([new Bar(1)])],
       ["Error cause", () => new Error("e", { cause: new Foo(1) }), () => new Error("e", { cause: new Bar(1) })],
+      ["a property read through a Proxy", () => new Proxy({ inner: new Foo(1) }, {}), () => ({ inner: new Bar(1) })],
+      ["objects with other key orders", () => ({ inner: new Foo(1), z: 1 }), () => ({ z: 1, inner: new Bar(1) })],
+      [
+        "a named property of an array",
+        () => Object.assign([1], { inner: new Foo(1) }),
+        () => Object.assign([1], { inner: new Bar(1) }),
+      ],
+      ["an element of an array behind a Proxy", () => new Proxy([new Foo(1)], {}), () => [new Bar(1)]],
+      [
+        "an element after a hole",
+        () => Object.assign([, new Foo(1)], { x: 1 }),
+        () => Object.assign([, new Bar(1)], { x: 1 }),
+      ],
     ] as const) {
       test(`propagates through ${name}`, () => {
         assert.strictEqual(util.isDeepStrictEqual(makeA(), makeB()), false);
@@ -1236,6 +2818,39 @@ describe("util.isDeepStrictEqual", () => {
 
     test("does not leak into assert.deepStrictEqual", () => {
       assert.throws(() => assert.deepStrictEqual(new Foo(42), new Bar(42)));
+    });
+
+    test("reads a Proxy through its get trap in both argument orders", () => {
+      const lying = () => lyingProxy({ a: 1 }, "a", 2);
+      same(
+        [
+          util.isDeepStrictEqual({ a: 1 }, lying(), true as any),
+          util.isDeepStrictEqual(lying(), { a: 1 }, true as any),
+          util.isDeepStrictEqual({ a: 2 }, lying(), true as any),
+          util.isDeepStrictEqual(lying(), { a: 2 }, true as any),
+        ],
+        [false, false, true, true],
+      );
+
+      const lenient = new (assert as any).Assert({ skipPrototype: true });
+      assert.throws(() => lenient.deepStrictEqual({ a: 1 }, lying()), assert.AssertionError);
+      assert.throws(() => lenient.deepStrictEqual(lying(), { a: 1 }), assert.AssertionError);
+      assert.doesNotThrow(() => lenient.deepStrictEqual({ a: 2 }, lying()));
+      assert.doesNotThrow(() => lenient.deepStrictEqual(lying(), { a: 2 }));
+    });
+
+    // Node 26.3.0 lists no key of such a global and answers false four times. This is Node 26.12.1.
+    test("reads the global of a node:vm context over a Proxy through that Proxy in both argument orders", () => {
+      const global = () => vm.runInContext("this", vm.createContext(lyingProxy({ a: 1 }, "a", 2)));
+      same(
+        [
+          util.isDeepStrictEqual({ a: 1 }, global(), true as any),
+          util.isDeepStrictEqual(global(), { a: 1 }, true as any),
+          util.isDeepStrictEqual({ a: 2 }, global(), true as any),
+          util.isDeepStrictEqual(global(), { a: 2 }, true as any),
+        ],
+        [false, false, true, true],
+      );
     });
   });
 });
