@@ -1,8 +1,16 @@
 #include "V8Object.h"
 #include "shim/InternalFieldObject.h"
 #include "V8HandleScope.h"
+#include "napi.h"
+#include "JavaScriptCore/AOTPropertyWalk.h"
+#include "JavaScriptCore/ArgList.h"
+#include "JavaScriptCore/ButterflyInlines.h"
 #include "JavaScriptCore/ConstructData.h"
+#include "JavaScriptCore/DeferGCInlines.h"
+#include "JavaScriptCore/IdentifierInlines.h"
+#include "JavaScriptCore/JSObjectInlines.h"
 #include "JavaScriptCore/ObjectConstructor.h"
+#include "JavaScriptCore/PropertyNameArray.h"
 #include "v8_compatibility_assertions.h"
 
 ASSERT_V8_TYPE_LAYOUT_MATCHES(v8::Object)
@@ -11,6 +19,17 @@ ASSERT_V8_ENUM_MATCHES(PropertyAttribute, None)
 ASSERT_V8_ENUM_MATCHES(PropertyAttribute, ReadOnly)
 ASSERT_V8_ENUM_MATCHES(PropertyAttribute, DontEnum)
 ASSERT_V8_ENUM_MATCHES(PropertyAttribute, DontDelete)
+
+ASSERT_V8_ENUM_MATCHES(PropertyFilter, ALL_PROPERTIES)
+ASSERT_V8_ENUM_MATCHES(PropertyFilter, ONLY_WRITABLE)
+ASSERT_V8_ENUM_MATCHES(PropertyFilter, ONLY_ENUMERABLE)
+ASSERT_V8_ENUM_MATCHES(PropertyFilter, ONLY_CONFIGURABLE)
+ASSERT_V8_ENUM_MATCHES(PropertyFilter, SKIP_STRINGS)
+ASSERT_V8_ENUM_MATCHES(PropertyFilter, SKIP_SYMBOLS)
+
+ASSERT_V8_ENUM_MATCHES(KeyConversionMode, kConvertToString)
+ASSERT_V8_ENUM_MATCHES(KeyConversionMode, kKeepNumbers)
+ASSERT_V8_ENUM_MATCHES(KeyConversionMode, kNoNumbers)
 
 using JSC::Identifier;
 using JSC::JSFinalObject;
@@ -187,6 +206,78 @@ int Object::GetIdentityHash()
     return static_cast<int>(reinterpret_cast<uintptr_t>(localToCell()) & INT_MAX) | 1;
 }
 
+// Not a Structure that is or was a dictionary's, a prototype's, or one with immutable properties. Indexed storage is not copied by words.
+static bool canShareStructure(JSC::Structure* structure)
+{
+    return !structure->hasBeenDictionary() && !structure->mayBePrototype() && !structure->mayHaveImmutableProperties() && !JSC::hasIndexedProperties(structure->indexingType());
+}
+
+// Like V8, which copies the object's words with its map. The shared Structure keeps inline caches monomorphic.
+static JSObject* cloneWithSameStructure(JSC::VM& vm, JSObject* source)
+{
+    JSC::Structure* structure = source->structure();
+    unsigned outOfLineCapacity = structure->outOfLineCapacity();
+    // Nothing keeps the butterfly alive until the cell that owns it exists.
+    JSC::DeferGC deferGC(vm);
+    JSC::Butterfly* butterfly = nullptr;
+    if (outOfLineCapacity) {
+        butterfly = JSC::Butterfly::createUninitialized(vm, nullptr, 0, outOfLineCapacity, false, 0);
+        memcpy(butterfly->propertyStorage() - outOfLineCapacity, source->butterfly()->propertyStorage() - outOfLineCapacity, outOfLineCapacity * sizeof(JSC::EncodedJSValue));
+    }
+    if (source->type() == JSC::FinalObjectType) {
+        return JSFinalObject::createWithButterflyCopyingInlineStorage(vm, structure, butterfly, source->inlineStorageUnsafe());
+    }
+    return shim::InternalFieldObject::createWithFieldsOf(vm, structure, butterfly, *uncheckedDowncast<shim::InternalFieldObject>(source));
+}
+
+// A plain object that `bun build --compile --aot` code made has its properties where no Structure lists them, so the copy is an ordinary object that gets each of them by definition.
+static JSObject* cloneCompiledObject(JSC::VM& vm, JSObject* source)
+{
+    NapiUngatedScope ungated { vm };
+    // No JS runs below: only an allocation can fail, which is fatal in V8 too.
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    JSGlobalObject* globalObject = source->realm();
+    JSValue prototype = source->getPrototypeDirect();
+    JSObject* copy = prototype.isObject() ? JSC::constructEmptyObject(globalObject, JSC::asObject(prototype)) : JSC::constructEmptyObject(vm, globalObject->nullPrototypeObjectStructure());
+    JSC::PropertyNameArrayBuilder names(vm, JSC::PropertyNameMode::StringsAndSymbols, JSC::PrivateSymbolMode::Include);
+    source->methodTable()->getOwnPropertyNames(source, globalObject, names, JSC::DontEnumPropertiesMode::Include);
+    scope.releaseAssertNoException();
+    for (const Identifier& name : names) {
+        JSC::PropertyDescriptor descriptor;
+        bool isOwn = source->getOwnPropertyDescriptor(globalObject, name, descriptor);
+        scope.releaseAssertNoException();
+        if (!isOwn)
+            continue;
+        copy->methodTable()->defineOwnProperty(copy, globalObject, name, descriptor, false);
+        scope.releaseAssertNoException();
+    }
+    bool isExtensible = source->isExtensible(globalObject);
+    scope.releaseAssertNoException();
+    if (!isExtensible) {
+        copy->methodTable()->preventExtensions(copy, globalObject);
+        scope.releaseAssertNoException();
+    }
+    return copy;
+}
+
+Local<Object> Object::Clone()
+{
+    Isolate* isolate = Isolate::GetCurrent();
+    auto& vm = isolate->vm();
+
+    JSObject* source = localToObjectPointer<JSObject>();
+    const bool isPlainOrFromTemplate = source->type() == JSC::FinalObjectType || source->classInfo() == shim::InternalFieldObject::info();
+    // V8 copies every object that it stores as an ordinary or API object, and arrays, RegExps, Errors and WebAssembly objects. It fails a CHECK for the rest.
+    if (!isPlainOrFromTemplate || !canShareStructure(source->structure())) [[unlikely]] {
+        if (JSC::AOT::PropertyWalk::isCompiledObject(source))
+            return isolate->currentHandleScope()->createLocal<Object>(vm, cloneCompiledObject(vm, source));
+        auto message = WTF::makeString("v8::Object::Clone is only implemented for a plain object or a template instance that has no index keys and never was a prototype or a dictionary. This object's class is "_s, source->classInfo()->className).utf8();
+        auto bytes = byteCast<char>(message.span());
+        Bun__panic(bytes.data(), bytes.size());
+    }
+    return isolate->currentHandleScope()->createLocal<Object>(vm, cloneWithSameStructure(vm, source));
+}
+
 Maybe<bool> Object::DefineOwnProperty(Local<Context> context, Local<Name> key, Local<Value> value, PropertyAttribute attributes)
 {
     Zig::GlobalObject* globalObject = context->globalObject();
@@ -209,6 +300,65 @@ Maybe<bool> Object::DefineOwnProperty(Local<Context> context, Local<Name> key, L
     bool success = object->methodTable()->defineOwnProperty(object, globalObject, identifier, descriptor, false);
     RETURN_IF_EXCEPTION(scope, Nothing<bool>());
     return Just(success);
+}
+
+MaybeLocal<Array> Object::GetOwnPropertyNames(Local<Context> context)
+{
+    return GetOwnPropertyNames(context, static_cast<PropertyFilter>(ONLY_ENUMERABLE | SKIP_SYMBOLS), KeyConversionMode::kKeepNumbers);
+}
+
+MaybeLocal<Array> Object::GetOwnPropertyNames(Local<Context> context, PropertyFilter filter, KeyConversionMode key_conversion)
+{
+    Zig::GlobalObject* globalObject = context->globalObject();
+    JSObject* object = localToObjectPointer<JSObject>();
+    auto& vm = JSC::getVM(globalObject);
+
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+
+    const bool skipStrings = filter & SKIP_STRINGS;
+    const bool skipSymbols = filter & SKIP_SYMBOLS;
+
+    auto nameMode = JSC::PropertyNameMode::StringsAndSymbols;
+    if (skipSymbols) {
+        nameMode = JSC::PropertyNameMode::Strings;
+    } else if (skipStrings) {
+        nameMode = JSC::PropertyNameMode::Symbols;
+    }
+    const auto dontEnumMode = (filter & ONLY_ENUMERABLE) ? JSC::DontEnumPropertiesMode::Exclude : JSC::DontEnumPropertiesMode::Include;
+
+    JSC::PropertyNameArrayBuilder names(vm, nameMode, JSC::PrivateSymbolMode::Exclude);
+    if (!skipStrings || !skipSymbols) {
+        object->methodTable()->getOwnPropertyNames(object, globalObject, names, dontEnumMode);
+        RETURN_IF_EXCEPTION(scope, MaybeLocal<Array>());
+    }
+
+    JSC::MarkedArgumentBuffer keys;
+    for (const Identifier& name : names) {
+        if (filter & (ONLY_WRITABLE | ONLY_CONFIGURABLE)) {
+            JSC::PropertyDescriptor descriptor;
+            object->getOwnPropertyDescriptor(globalObject, name, descriptor);
+            RETURN_IF_EXCEPTION(scope, MaybeLocal<Array>());
+            // ONLY_WRITABLE rejects V8's READ_ONLY attribute, which an accessor property never has.
+            if ((filter & ONLY_WRITABLE) && !descriptor.isAccessorDescriptor() && !descriptor.writable()) {
+                continue;
+            }
+            if ((filter & ONLY_CONFIGURABLE) && !descriptor.configurable()) {
+                continue;
+            }
+        }
+        std::optional<uint32_t> index = JSC::parseIndex(name);
+        // V8 checks kNoNumbers with a debug assertion only, so index keys stay numbers as for kKeepNumbers.
+        if (index && key_conversion != KeyConversionMode::kConvertToString) {
+            keys.appendWithCrashOnOverflow(JSC::jsNumber(*index));
+        } else {
+            keys.appendWithCrashOnOverflow(JSC::identifierToJSValue(vm, name));
+        }
+    }
+
+    JSC::JSArray* array = JSC::constructArray(globalObject, static_cast<JSC::ArrayAllocationProfile*>(nullptr), keys);
+    RETURN_IF_EXCEPTION(scope, MaybeLocal<Array>());
+
+    return context->currentHandleScope()->createLocal<Array>(vm, array);
 }
 
 internal::ExternalPointerTag ToExternalPointerTag(uint16_t api_tag)
